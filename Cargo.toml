@@ -1,0 +1,67 @@
+[package]
+name = "supersonic-sniper"
+version = "0.0.1"
+edition = "2021"
+authors = ["25x8 <25x8@tuta.io>"]
+description = "A high-speed trading bot for Raydium on Solana"
+license = "GPL-3"
+
+[dependencies]
+# Command-line argument parsing
+clap = { version = "4.5.18", features = ["derive"] }
+
+# Configuration management
+config = "0.14.0"
+
+# Serialization/deserialization
+borsh = "1.5.1"
+borsh-derive = "1.5.1"
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.128"
+
+# Asynchronous runtime
+tokio = { version = "1.40.0", features = ["full", "tracing"] }
+tokio-util = { version = "0.7.12", features = ["time"] }
+tungstenite = "0.24.0"
+tokio-tungstenite = { version = "0.24.0", features = ["native-tls"] }
+
+# Solana blockchain interaction
+solana-client = "2.0.13"
+solana-sdk = { version = "2.0.13", features = ["serde_json"] }
+solana-program = "2.0.13"
+solana-account-decoder = "2.0.13"
+solana-transaction-status = "2.0.13"
+spl-token = { version = "6.0.0", features = ["no-entrypoint"] }
+spl-associated-token-account = "5.0.1"
+
+mpl-token-metadata = "4.1.2"
+
+# Error handling
+anyhow = "1.0.89"
+
+# Logging
+log = "0.4.22"
+env_logger = "0.11.5"
+base64 = "0.22.1"
+tokio-stream = "0.1.16"
+num-derive = "0.4.2"
+thiserror = "1.0.63"
+num-traits = "0.2.19"
+futures = "0.3.30"
+chrono = "0.4.38"
+url = "2.5.2"
+http = "1.1.0"
+uuid = { version = "1.10.0", features = ["v4", "serde"] }
+console-subscriber = "0.4.0"
+dashmap = { version = "6.1.0", features = ["serde", "inline"] }
+
+[patch.crates-io.aes-gcm-siv]
+git = "https://github.com/RustCrypto/AEADs"
+rev = "6105d7a5591aefa646a95d12b5e8d3f55a9214ef"
+
+[patch.crates-io.curve25519-dalek]
+git = "https://github.com/solana-labs/curve25519-dalek.git"
+rev = "c14774464c4d38de553c6ef2f48a10982c1b4801"
+
+[build]
+rustflags = ["--cfg", "tokio_unstable"]
