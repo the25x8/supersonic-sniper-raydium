@@ -2,3 +2,4 @@
 /config/config.yml
 .idea
 wallet.json
+/data
