@@ -3,13 +3,19 @@ use chrono::{TimeZone, Utc};
 use dashmap::DashMap;
 use log::info;
 use solana_program::pubkey::Pubkey;
+use tokio_util::sync::CancellationToken;
 use crate::trader;
 use crate::trader::models::Trade;
 
 pub async fn print_active_trades() {
+    let dummy_cancel_token = CancellationToken::new();
+
     // Load active trades
     let active_trades: Arc<DashMap<Pubkey, Vec<Trade>>> = Arc::new(DashMap::new());
-    let backup = trader::backup::Backup::new_for_trades(active_trades.clone());
+    let backup = trader::backup::Backup::new_for_trades(
+        active_trades.clone(),
+        dummy_cancel_token,
+    );
     backup.load_active_trades().await;
 
     if active_trades.is_empty() {
@@ -62,13 +68,13 @@ fn format_active_trade_row(trade: &Trade) -> String {
 
     let tokens = if trade.buy_price > 0.0 {
         let tokens_bought = trade.quote_in_amount / trade.buy_price;
-        format!("{:.10}", tokens_bought)
+        format!("{:.9}", tokens_bought)
     } else {
         "N/A".to_string()
     };
 
     let buy_price = if trade.buy_price > 0.0 {
-        format!("{:.10}", trade.buy_price)
+        format!("{:.9}", trade.buy_price)
     } else {
         "N/A".to_string()
     };
@@ -80,7 +86,7 @@ fn format_active_trade_row(trade: &Trade) -> String {
     };
 
     let profit_amount = if trade.profit_amount != 0.0 {
-        format!("{:.10}", trade.profit_amount)
+        format!("{:.9}", trade.profit_amount)
     } else {
         "N/A".to_string()
     };

@@ -3,13 +3,19 @@ use dashmap::DashMap;
 use log::info;
 use chrono::{NaiveDateTime};
 use solana_sdk::pubkey::Pubkey;
+use tokio_util::sync::CancellationToken;
 use crate::trader;
-use crate::trader::models::{Order, OrderStatus, OrderKind};
+use crate::trader::models::{Order, OrderKind};
 
 pub async fn print_pending_orders() {
+    let dummy_cancel_token = CancellationToken::new();
+
     // Load pending orders
-    let pending_orders: Arc<DashMap<Pubkey, Order>> = Arc::new(DashMap::new());
-    let backup = trader::backup::Backup::new_for_pending_orders(pending_orders.clone());
+    let pending_orders: Arc<DashMap<Pubkey, Vec<Order>>> = Arc::new(DashMap::new());
+    let backup = trader::backup::Backup::new_for_pending_orders(
+        pending_orders.clone(),
+        dummy_cancel_token,
+    );
     backup.load_pending_orders().await;
 
     if pending_orders.is_empty() {
@@ -20,6 +26,7 @@ pub async fn print_pending_orders() {
     // Collect orders into a vector and sort by created_at timestamp
     let mut orders = pending_orders.iter()
         .map(|entry| entry.value().clone())
+        .flatten()
         .collect::<Vec<_>>();
 
     // Sort orders by created_at timestamp
@@ -67,7 +74,7 @@ fn format_pending_order_row(order: &Order) -> String {
     };
 
     format!(
-        "{:<36} | {:<44} | {:<10} | {:<12} | {:<12.10} | {:<12.10} | {:<19} | {:<19}",
+        "{:<36} | {:<44} | {:<10} | {:<12} | {:<12.9} | {:<12.9} | {:<19} | {:<19}",
         order.id,
         order.pool,
         order.direction,

@@ -17,7 +17,8 @@ use solana_sdk::pubkey::Pubkey;
 use tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tokio::sync::mpsc::Sender;
-
+use tokio_util::sync::CancellationToken;
+use crate::config::BloxrouteConfig;
 use crate::raydium::{LiquidityStateV4, MainnetProgramId};
 use crate::detector::{DetectedPool, Pool, PoolType, SourceType};
 use crate::error::handle_attempt;
@@ -123,22 +124,23 @@ struct BXPoolInfo {
 
 pub struct RaydiumDetector {
     pubsub_client: Arc<PubsubClient>,
+    cancel_token: CancellationToken,
     tx: Sender<DetectedPool>, // Detected pool channel
-    bx_ws_url: Option<String>,
-    bx_auth_token: Option<String>,
+    bloxroute_config: BloxrouteConfig,
 }
 
 impl RaydiumDetector {
     pub async fn new(
         tx: Sender<DetectedPool>,
         rpc_ws_url: &str,
-        bloxroute_ws_url: Option<&str>,
-        bloxroute_auth_token: Option<&str>,
+        bloxroute_config: BloxrouteConfig,
+        cancel_token: CancellationToken,
     ) -> Self {
         // Initialize the Pubsub client instance
         let pubsub_client = match PubsubClient::new(rpc_ws_url).await {
             Ok(client) => client,
             Err(e) => {
+                cancel_token.cancel(); // Gracefully exit the bot
                 panic!("Failed to create WebSocket client: {}", e);
             }
         };
@@ -146,25 +148,28 @@ impl RaydiumDetector {
 
         Self {
             tx,
+            cancel_token,
+            bloxroute_config,
             pubsub_client: pubsub_client_arc,
-            bx_ws_url: bloxroute_ws_url.map(|s| s.to_string()),
-            bx_auth_token: bloxroute_auth_token.map(|s| s.to_string()),
         }
     }
 
     pub async fn start(&self) {
         tokio::join!(
             self.subscribe_to_amm_pools_bloxroute(),
-            self.subscribe_to_amm_pools_pubsub(),
+            self.subscribe_to_amm_pools_pubsub()
         );
-
-        // If all subscriptions fail, abort the program
-        panic!("All Raydium pool subscriptions failed");
     }
 
+    /// Subscribe to the Raydium AMM pools via solana sdk PubSub.
+    /// It implements reconnect logic with backoff and max retries.
+    /// PubSub is the base subscription method for detector,
+    /// if it fails the bot should be gracefully exited.
     async fn subscribe_to_amm_pools_pubsub(&self) {
         // Clone the Pubsub client instance
         let pubsub = self.pubsub_client.clone();
+        let cancel_token = self.cancel_token.clone();
+
         let mut attempts = 0;
 
         loop {
@@ -204,9 +209,9 @@ impl RaydiumDetector {
             };
 
             // Subscribe to the amm program account stream
-            let (mut accounts, _) =
+            let (mut accounts, program_unsubscribe) =
                 match pubsub.program_subscribe(&MainnetProgramId::AmmV4.get_pubkey(), Some(config)).await {
-                    Ok((accounts, root_unsubscribe)) => (accounts, root_unsubscribe),
+                    Ok((accounts, program_unsubscribe)) => (accounts, program_unsubscribe),
                     Err(e) => {
                         error!("Failed to subscribe to Raydium pool stream: {}", e.to_string());
 
@@ -216,8 +221,9 @@ impl RaydiumDetector {
                             MAX_SUBSCRIPTION_RETRIES,
                             RECONNECT_BACKOFF,
                         ).await {
-                            error!("Max subscription retries for Raydium pool stream exceeded");
-                            break;
+                            error!("Max subscription retries for Raydium pool via PubSub stream exceeded");
+                            cancel_token.cancel(); // Gracefully exit the bot
+                            return;
                         }
 
                         // Retry the subscription
@@ -228,39 +234,52 @@ impl RaydiumDetector {
             // Reset the connection attempts counter
             attempts = 0;
 
-            // Set the start timestamp when the subscription is successful
-            let start_timestamp = Utc::now();
+            tokio::select! {
+                // Handle the program subscription stream
+                _ = async {
+                    info!(
+                        "\n\
+                        🌊 Raydium Pool Stream\n\
+                        ▶️ Subscribed to Raydium Pool Stream via PubSub\n\
+                        ▶️ Waiting for new pools...\n\
+                        ───────────────────────────────────────\n"
+                    );
 
-            info!(
-                "\n\
-                🌊 Raydium Pool Stream\n\
-                ▶️ Subscribed to Raydium Pool Stream via PubSub\n\
-                ▶️ Waiting for new pools...\n\
-                ───────────────────────────────────────"
-            );
 
-            // Continue processing the subscription
-            while let Some(response) = accounts.next().await {
-                // Read public key of amm pool
-                let pubkey = match Pubkey::from_str(&response.value.pubkey) {
-                    Ok(pk) => pk,
-                    Err(e) => {
-                        error!("Failed to parse pool pubkey: {}", e);
-                        continue;
+                    // Continue processing the subscription
+                    while let Some(response) = accounts.next().await {
+                        // Read public key of amm pool
+                        let pubkey = match Pubkey::from_str(&response.value.pubkey) {
+                            Ok(pk) => pk,
+                            Err(e) => {
+                                error!("Failed to parse pool pubkey: {}", e);
+                                continue;
+                            }
+                        };
+
+                        // Deserialize the liquidity state data from the account into a DetectedPool instance
+                        if let Err(e) = self.handle_account_update(pubkey, &response.value.account.data).await {
+                            error!("Failed to handle account update: {}", e);
+                        }
                     }
-                };
+                } => {}
 
-                // Deserialize the liquidity state data from the account into a DetectedPool instance
-                if let Err(e) = self.handle_account_update(pubkey, &response.value.account.data).await {
-                    error!("Failed to handle account update: {}", e);
+                // Unsubscribe and exit the task if cancelled
+                _ = cancel_token.cancelled() => {
+                    info!("Unsubscribing from Raydium pool stream via PubSub");
+                    program_unsubscribe().await; // Unsubscribe from the program
+                    break;
                 }
+
+                else => break,
             }
 
             // Wait before retrying to avoid busy looping
             info!(
-                "\n🔄 [RECONNECT]\n\
+                "\n\
+                🔄 [RECONNECT]\n\
                 Resubscribing to Raydium pool stream via PubSub...\n\
-                ───────────────────────────",
+                ───────────────────────────\n",
             );
 
             // Try to reconnect after a delay
@@ -328,23 +347,32 @@ impl RaydiumDetector {
         Ok(())
     }
 
+    /// A separate subscription method for Raydium AMM pools via Bloxroute.
+    /// It uses WebSocket connection to subscribe to the Bloxroute API stream.
+    /// Bloxroute is an optional subscription method, if it fails the bot should
+    /// continue running with PubSub subscription.
     async fn subscribe_to_amm_pools_bloxroute(&self) {
+        if !self.bloxroute_config.enabled {
+            warn!("Bloxroute is disabled, skipping Bloxroute subscription...");
+            return;
+        }
+
+        // If ws url is set, auth token is required
+        let ws_url = self.bloxroute_config.ws_url.clone();
+        let auth_token = self.bloxroute_config.auth_token.clone();
+
+        if ws_url.is_none() {
+            warn!("Bloxroute WebSocket URL not set, skipping Bloxroute subscription...");
+            return;
+        }
+        if auth_token.is_none() {
+            error!("Bloxroute WebSocket URL is set, but no auth token provided");
+            return;
+        }
+
         let mut attempts = 0;
 
         loop {
-            // If ws url is set, auth token is required
-            let ws_url = self.bx_ws_url.clone();
-            let auth_token = self.bx_auth_token.clone();
-
-            if ws_url.is_none() {
-                warn!("Bloxroute WebSocket URL not set, skipping Bloxroute subscription...");
-                break;
-            }
-            if auth_token.is_none() {
-                error!("Bloxroute WebSocket URL is set, but no auth token provided");
-                break;
-            }
-
             // Prepare the subscription request
             let subscription_request = json!({
                 "jsonrpc": "2.0",
@@ -354,7 +382,7 @@ impl RaydiumDetector {
             });
 
             // Convert the URL into a WebSocket Request
-            let mut request = match ws_url.unwrap().to_string().into_client_request() {
+            let mut request = match ws_url.clone().unwrap().to_string().into_client_request() {
                 Ok(req) => req,
                 Err(e) => {
                     error!("Invalid Bloxroute WebSocket URL: {}", e);
@@ -363,7 +391,10 @@ impl RaydiumDetector {
             };
 
             // Add the Authorization header
-            request.headers_mut().append("Authorization", http::HeaderValue::from_str(auth_token.unwrap().as_str()).unwrap());
+            request.headers_mut().append(
+                "Authorization",
+                http::HeaderValue::from_str(auth_token.clone().unwrap().as_str()).unwrap(),
+            );
 
             // Connect to WebSocket
             let ws_stream = match connect_async(request).await {
@@ -378,7 +409,7 @@ impl RaydiumDetector {
                         RECONNECT_BACKOFF,
                     ).await {
                         error!("Max connection retries for Bloxroute WebSocket exceeded");
-                        break;
+                        return;
                     }
 
                     // Retry the connection
@@ -392,115 +423,134 @@ impl RaydiumDetector {
             // Reset the connection attempts counter
             attempts = 0;
 
-            // Split the WebSocket stream into sender and receiver
+            // Split the WebSocket stream before the select! block
             let (mut write, mut read) = ws_stream.split();
 
             // Send the subscription request
             if let Err(e) = write.send(Message::Text(subscription_request.to_string())).await {
                 error!("Failed to subscribe to Raydium pool stream via Bloxroute: {}", e);
-                break;
+                return;
             }
 
-            // Loop to receive new pool events
-            while let Some(message_result) = read.next().await {
-                let message = match message_result {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        error!("Failed to receive message from Bloxroute WebSocket: {}", e);
-                        break;
-                    }
-                };
-
-
-                // Process the message
-                match message {
-                    Message::Text(text) => {
-                        // Attempt to deserialize into BXPoolEvent
-                        let event = match serde_json::from_str::<BXPoolEvent>(&text) {
-                            Ok(event) => event,
+            tokio::select! {
+                // Handle the subscription stream
+                _ = async {
+                    while let Some(message_result) = read.next().await {
+                        let message = match message_result {
+                            Ok(msg) => msg,
                             Err(e) => {
-                                error!("Failed to parse Raydium pool event: {}", e);
-                                continue;
+                                error!("Failed to receive message from Bloxroute WebSocket: {}", e);
+                                break;
                             }
                         };
 
-                        // Process the event
-                        match event {
-                            BXPoolEvent::NewPool(event) => {
-                                // Extract the pool data
-                                let pool = event.params.result.pool;
-                                let pubkey = match Pubkey::from_str(pool.pool_address.as_str()) {
-                                    Ok(pk) => pk,
+                        // Process the message
+                        match message {
+                            Message::Text(text) => {
+                                // Attempt to deserialize into BXPoolEvent
+                                let event = match serde_json::from_str::<BXPoolEvent>(&text) {
+                                    Ok(event) => event,
                                     Err(e) => {
-                                        error!("Failed to parse pool pubkey: {}", e);
+                                        error!("Failed to parse Raydium pool event: {}", e);
                                         continue;
                                     }
                                 };
 
-                                // Build the DetectedPool instance
-                                let pool_info = Pool {
-                                    pubkey,
-                                    in_whitelist: false,
-                                    slot: event.params.result.slot.parse().unwrap_or(0),
-                                    pool_address: pool.pool_address,
-                                    pool_type: PoolType::RaydiumAmm,
-                                    status: 6, // Assume SwapOnly status
-                                    base_decimals: None, // Not available for PubSub
-                                    base_mint: Pubkey::from_str(pool.token1_mint_address.as_str()).unwrap(),
-                                    base_vault: Pubkey::from_str(pool.liquidity_pool_keys.base_vault.as_str()).unwrap(),
-                                    base_reserves: Some(pool.token1_reserves.parse().unwrap_or(0)),
-                                    quote_decimals: None, // Not available for PubSub
-                                    quote_mint: Pubkey::from_str(pool.token2_mint_address.as_str()).unwrap(),
-                                    quote_vault: Pubkey::from_str(pool.liquidity_pool_keys.quote_vault.as_str()).unwrap(),
-                                    quote_reserves: Some(pool.token2_reserves.parse().unwrap_or(0)),
-                                    open_time: Utc.timestamp_opt(pool.open_time.parse().unwrap_or(0), 0).unwrap(),
-                                    timestamp: Utc::now(),
-                                };
+                                // Process the event
+                                match event {
+                                    BXPoolEvent::NewPool(event) => {
+                                        // Extract the pool data
+                                        let pool = event.params.result.pool;
+                                        let pubkey = match Pubkey::from_str(pool.pool_address.as_str()) {
+                                            Ok(pk) => pk,
+                                            Err(e) => {
+                                                error!("Failed to parse pool pubkey: {}", e);
+                                                continue;
+                                            }
+                                        };
 
-                                // Send the detected pool to the channel
-                                if let Err(e) = self.tx.send(DetectedPool {
-                                    start_timestamp,
-                                    data: pool_info,
-                                    source: SourceType::BloxRoute,
-                                }).await {
-                                    error!("Failed to send new pool to the detector channel: {:?}", e);
+                                        // Build the DetectedPool instance
+                                        let pool_info = Pool {
+                                            pubkey,
+                                            in_whitelist: false,
+                                            slot: event.params.result.slot.parse().unwrap_or(0),
+                                            pool_address: pool.pool_address,
+                                            pool_type: PoolType::RaydiumAmm,
+                                            status: 6, // Assume SwapOnly status
+                                            base_decimals: None, // Not available for PubSub
+                                            base_mint: Pubkey::from_str(pool.token1_mint_address.as_str()).unwrap(),
+                                            base_vault: Pubkey::from_str(pool.liquidity_pool_keys.base_vault.as_str()).unwrap(),
+                                            base_reserves: Some(pool.token1_reserves.parse().unwrap_or(0)),
+                                            quote_decimals: None, // Not available for PubSub
+                                            quote_mint: Pubkey::from_str(pool.token2_mint_address.as_str()).unwrap(),
+                                            quote_vault: Pubkey::from_str(pool.liquidity_pool_keys.quote_vault.as_str()).unwrap(),
+                                            quote_reserves: Some(pool.token2_reserves.parse().unwrap_or(0)),
+                                            open_time: Utc.timestamp_opt(pool.open_time.parse().unwrap_or(0), 0).unwrap(),
+                                            timestamp: Utc::now(),
+                                        };
+
+                                        // Send the detected pool to the channel
+                                        if let Err(e) = self.tx.send(DetectedPool {
+                                            start_timestamp,
+                                            data: pool_info,
+                                            source: SourceType::BloxRoute,
+                                        }).await {
+                                            error!("Failed to send new pool to the detector channel: {:?}", e);
+                                        }
+                                    }
+                                    BXPoolEvent::WsConnected(event) => {
+                                        info!(
+                                            "\n\
+                                               🌊 Raydium Pool Stream\n\
+                                               ▶️ Subscribed to Raydium Pool Stream via BloxRoute\n\
+                                               ▶️ Waiting for new pools...\n\
+                                               ───────────────────────────────────────\n"
+                                        );
+                                    }
+                                    BXPoolEvent::WsError(event) => {
+                                        error!("Bloxroute WebSocket error: {}", event.error.message);
+                                        break;
+                                    }
                                 }
                             }
-                            BXPoolEvent::WsConnected(event) => {
-                                info!(
-                                    "\n\
-                                    🌊 Raydium Pool Stream\n\
-                                    ▶️ Subscribed to Raydium Pool Stream via BloxRoute\n\
-                                    ▶️ Waiting for new pools...\n\
-                                    ───────────────────────────────────────"
-                                );
+                            Message::Ping(ping) => {
+                                // Respond to pings to keep the connection alive
+                                if let Err(e) = write.send(Message::Pong(ping)).await {
+                                    error!("Failed to send Pong message: {}", e);
+                                    break;
+                                }
                             }
-                            BXPoolEvent::WsError(event) => {
-                                error!("Bloxroute WebSocket error: {}", event.error.message);
+                            Message::Close(frame) => {
+                                // Handle the close frame
+                                warn!("Bloxroute WebSocket closed: {:?}", frame);
                                 break;
                             }
+                            _ => {
+                                continue;
+                            }
                         }
                     }
-                    Message::Ping(ping) => {
-                        // Respond to pings to keep the connection alive
-                        if let Err(e) = write.send(Message::Pong(ping)).await {
-                            error!("Failed to send Pong message: {}", e);
-                            break;
-                        }
+                } => {}
+
+                // Handle cancellation of the task
+                _ = self.cancel_token.cancelled() => {
+                    // Close the WebSocket connection and exit the task
+                    info!("Unsubscribing from Raydium pool stream via BloxRoute");
+                    match write.close().await {
+                        Ok(_) => {},
+                        Err(e) => error!("Failed to close Bloxroute WebSocket: {}", e),
                     }
-                    Message::Close(frame) => {
-                        break;
-                    }
-                    _ => {
-                        continue;
-                    }
+                    break;
                 }
+
+                // Handle the root unsubscribe
+                else => break,
             }
 
             info!(
                 "\n🔄 [RECONNECT]\n\
                 Resubscribing to Raydium pool stream via Bloxroute...\n\
-                ───────────────────────────",
+                ───────────────────────────\n",
             );
 
             // Try to reconnect after a delay

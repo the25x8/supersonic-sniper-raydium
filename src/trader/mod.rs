@@ -18,6 +18,7 @@ use solana_account_decoder::parse_token::UiTokenAmount;
 use spl_token::state::{Mint};
 use tokio::sync::mpsc::{Receiver};
 use tokio::sync::{Semaphore};
+use tokio_util::sync::CancellationToken;
 use crate::config::{StrategyConfig, TraderConfig};
 use crate::detector::{Pool, PoolType};
 use crate::solana::amount_utils::token_amount_to_float;
@@ -60,6 +61,7 @@ pub struct Trader {
     active_trades: Arc<DashMap<Pubkey, Vec<Trade>>>,
     market_monitor: Arc<MarketMonitor>,
     executor: Arc<Executor>,
+    cancel_token: CancellationToken,
 }
 
 impl Trader {
@@ -70,18 +72,22 @@ impl Trader {
         wallet: Arc<Wallet>,
         pool_rx: Receiver<Pool>,
         ws_url: &str,
+        cancel_token: CancellationToken,
     ) -> Self {
         // Initialize the active trades hashmap
         let active_trades = Arc::new(DashMap::new());
 
         // Initialize the backup helper and load the initial active trades from disk
-        let backup = Arc::new(Backup::new_for_trades(active_trades.clone()));
+        let backup = Arc::new(Backup::new_for_trades(
+            active_trades.clone(),
+            cancel_token.clone(),
+        ));
         backup.load_active_trades().await;
 
         // Auto sync the trades backup
         let backup_clone = backup.clone();
         tokio::spawn(async move {
-            backup_clone.start_trades_save().await;
+            backup_clone.trades_auto_sync().await;
         });
 
         // Initialize the market monitor module
@@ -90,6 +96,7 @@ impl Trader {
             client.clone(),
             ws_url,
             market_tx,
+            cancel_token.clone(),
         ).await);
 
         // The order executor module
@@ -99,6 +106,7 @@ impl Trader {
             active_trades.clone(),
             market_monitor.clone(),
             backup.clone(),
+            cancel_token.clone(),
         ).await;
 
         // Start the market data loop in a separate task
@@ -116,6 +124,7 @@ impl Trader {
             pool_rx,
             backup,
             executor,
+            cancel_token,
             market_monitor,
             active_trades,
         }
@@ -125,11 +134,20 @@ impl Trader {
     pub async fn start(&mut self) {
         // Create a semaphore with a limit
         let semaphore = Arc::new(Semaphore::new(10));
+        let cancel_token = self.cancel_token.clone();
+        tokio::select! {
+            // Subscribe to new detected pools and initiate the trading process
+            _ = async {
+                while let Some(pool) = self.pool_rx.recv().await {
+                    self.process_detected_pool(pool, self.executor.clone(), semaphore.clone()).await;
+                }
+            } => {}
 
-        // Subscribe to new detected pools and initiate the trading process
-        while let Some(pool) = self.pool_rx.recv().await {
-            let _permit = semaphore.acquire().await; // Acquire permit before processing
-            self.process_detected_pool(pool, self.executor.clone(), semaphore.clone()).await;
+            // Stop the trader if the cancel token is triggered
+            _ = cancel_token.cancelled() => {
+                info!("Trader module has been terminated");
+                return;
+            }
         }
     }
 
@@ -142,6 +160,7 @@ impl Trader {
         active_trades: Arc<DashMap<Pubkey, Vec<Trade>>>,
         market_monitor: Arc<MarketMonitor>,
         backup: Arc<Backup>,
+        cancel_token: CancellationToken,
     ) -> Arc<Executor> {
         // Initialize the executor module and get the arc reference
         let (executed_orders_tx, mut executed_orders_rx) = tokio::sync::mpsc::channel(10);
@@ -149,6 +168,7 @@ impl Trader {
             client.clone(),
             wallet.clone(),
             executed_orders_tx,
+            cancel_token,
         ).await);
 
         // Create a task to listen for executed orders and process them.
@@ -233,7 +253,7 @@ impl Trader {
                             let take_profit_percent = (market_data.price - trade.buy_price) / trade.buy_price * 100.0;
 
                             debug!(
-                                "🟢 Checking Take Profit Condition for Trade {}\n\
+                                "\n🟢 Checking Take Profit Condition for Trade {}\n\
                                  ──────────────────────────────────────────────\n\
                                  - Price Change:      {:+.10}%\n\
                                  - Buy Price:         {:.10}\n\
@@ -254,7 +274,7 @@ impl Trader {
                                 match executor.order(take_profit_order).await {
                                     Ok(_) => {
                                         info!(
-                                            "🟢 ✅ Take Profit Condition Met for Trade {}\n\
+                                            "\n🟢 ✅ Take Profit Condition Met for Trade {}\n\
                                              ──────────────────────────────────────────────\n\
                                              - Price Change:      {:+.10}%\n\
                                              - Buy Price:         {:.10}\n\
@@ -262,7 +282,7 @@ impl Trader {
                                              - Take Profit Price: {:.10} (at +{:.2}%)\n\
                                              - Strategy:          Take Profit at +{:.2}%\n\
                                              \
-                                             🚀 Take Profit Order Executed!",
+                                             🚀 Take Profit Order Executed!\n",
                                             trade.id,
                                             take_profit_percent,        // Change in price as a percentage
                                             trade.buy_price,            // Original buy price
@@ -293,7 +313,7 @@ impl Trader {
                             let stop_loss_percent = (trade.buy_price - market_data.price) / trade.buy_price * 100.0;
 
                             debug!(
-                                "🔴 Checking Stop Loss Condition for Trade {}\n\
+                                "\n🔴 Checking Stop Loss Condition for Trade {}\n\
                                  ──────────────────────────────────────────────\n\
                                  - Price Change:      {:+.10}%\n\
                                  - Buy Price:         {:.10}\n\
@@ -314,7 +334,7 @@ impl Trader {
                                 match executor.order(stop_loss_order).await {
                                     Ok(_) => {
                                         info!(
-                                            "❌ Stop Loss Condition Met for Trade {}\n\
+                                            "\n❌ Stop Loss Condition Met for Trade {}\n\
                                              ──────────────────────────────────────────────\n\
                                              - Price Change:      {:+.10}%\n\
                                              - Buy Price:         {:.10}\n\
@@ -539,7 +559,7 @@ impl Trader {
                             let completed_sell_order = trade_in_map.get_completed_sell_order().unwrap();
                             let completed_in = completed_sell_order.confirmed_at - buy_order.created_at;
                             info!(
-                                "🟢 Trade Completed Successfully!\n\
+                                "\n🟢 Trade Completed Successfully!\n\
                                 ───────────────────────────────\n\
                                 👉 Trade ID:        {}\n\
                                 👉 Result:          {}\n\

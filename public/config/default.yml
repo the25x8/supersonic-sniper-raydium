@@ -1,0 +1,156 @@
+rpc:
+  # Solana RPC URL is required. It can be a public or private RPC node.
+  url: "https://api.mainnet-beta.solana.com"
+
+  # WebSocket URL is required for account updates.
+  ws_url: "wss://api.mainnet-beta.solana.com"
+
+bloxroute:
+  # If enabled, the bot will use Bloxroute to broadcast
+  # transactions to speed up the transaction propagation.
+  enabled: false
+
+  # Bloxroute URL and WebSocket URL.
+  url: "https://uk.solana.dex.blxrbdn.com"
+  ws_url: "wss://uk.solana.dex.blxrbdn.com/ws"
+
+  # Auth token is required when using Bloxroute.
+  auth_token: ""
+
+# Wallet configuration
+wallet:
+  # The bot will use the first account in the wallet to trade.
+  # If you want to use a different account, you can specify the
+  # account index here.
+  account_index: 0
+
+  # Path to the wallet file. If you are using a wallet file, you can
+  # specify the path to the file here.
+  file_path: "/path/to/your/solana/wallet.json"
+
+  # Wallet secret key. If you are using a wallet secret key, you can
+  # specify the key here.
+  # secret_key: ""
+
+# Detector module configuration
+detector:
+  # Watchlist is a list of tokens that the bot will focus on.
+  # If the watchlist is empty, the bot will focus on all tokens.
+  # Otherwise, the bot will process only tokens from the watchlist.
+  watchlist: []
+#   watchlist:
+#     - "Dyg9HthwdkenToccZQM76TjWFoqSPfQd5d8iR8vspump"
+#     - "7tGAa9otm4Qmmd9Di1PQJCyyZz1Wh78drpH2TiaTEb5G"
+#     - "Bk6btMamZ2UiUdgxApy5w9iBRU9JY1Kr3T1Zgbae5jZw"
+#     - "7D7BRcBYepfi77vxySapmeqRNN1wsBBxnFPJGbH5pump"
+
+# Trader module configuration
+trader:
+  # List of conditions that can be used to choose the strategy.
+  # Any condition with a value of 0 or commented out will be ignored.
+  strategies:
+    # Base strategy suitable for most trading pairs.
+    base:
+      freezable: false # If the token can be frozen set to true.
+      mint_renounced: true # If the owner can mint new tokens set to false.
+      # meta_mutable: false # If the token metadata can be changed set to true.
+
+      quote_symbol: "WSOL" # The quote symbol of the trading pair can be USDC or WSOL.
+      # base_symbol: "XYZ" # The base symbol of the trading pair (token).
+
+      # If the pool detected time is older than the max_delay_since_detect,
+      # the bot will not trade. A checking will be performed before trade execution.
+      max_delay_since_detect: 8000 # milliseconds
+
+      # Some base conditions can lead to additional data being fetched.
+      # This will increase the time it takes to make a trading decision,
+      # as the bot needs to fetch the data from different sources.
+      # has_website: true
+      # has_social_networks: true
+      # has_community: true
+      # has_team: true
+      # has_audit: true
+      # has_whitepaper: true
+      # has_partnership: true
+      # min_audits_passed: 0
+      # min_social_networks: 0
+
+      # Price conditions. A price in the quote currency.
+      price_condition: "gt" # Price operator can be "eq", "gt", "gte", "lt", "lte", "in".
+      price: 0.0 # Price value.
+      # price_range: [0.0, 0.0] # Price range required when using "in" operator.
+
+      # Reserves conditions in the base and quote currencies.
+      reserves_base_condition: "gt" # Reserves operator can be "eq", "gt", "gte", "lt", "lte", "in".
+      reserves_base: 0.0
+      # reserves_base_range: [0.0, 0.0]
+      reserves_quote_condition: "gt"
+      reserves_quote: 10.0 # WSOL reserves.
+      # reserves_quote_range: [0.0, 0.0]
+
+      # Total supply conditions.
+      total_supply_condition: "gt" # Total supply operator can be "eq", "gt", "gte", "lt", "lte", "in".
+      total_supply: 0.0 # Total supply value.
+
+      # Market data conditions. Enable these conditions to filter tokens
+      # based on volume, transactions, makers, buyers, sellers, buys, sells.
+      # This data is fetched from the Solana Serum DEX API leads to additional
+      # time to make a trading decision and recommended to be disabled.
+      # volume_condition: "gt"
+      # volume: 0.0
+      # volume_range: [0.0, 0.0]
+
+      # buy_condition: "gt"
+      # buy: 0.0
+      # buy_range: [0.0, 0.0]
+
+      # sell_condition: "gt"
+      # sell: 0.0
+      # sell_range: [0.0, 0.0]
+
+      # txns_condition: "gt"
+      # txns: 0.0
+      # txns_range: [0.0, 0.0]
+
+      # makers_condition: "gt"
+      # makers: 0.0
+      # makers_range: [0.0, 0.0]
+
+      # byers_condition: "gt"
+      # byers: 0.0
+      # byers_range: [0.0, 0.0]
+
+      # sellers_condition: "gt"
+      # sellers: 0.0
+      # sellers_range: [0.0, 0.0]
+
+      # buys_condition: "gt"
+      # buys: 0.0
+      # buys_range: [0.0, 0.0]
+
+      # sells_condition: "gt"
+      # sells: 0.0
+      # sells_range: [0.0, 0.0]
+
+      # Configuration for executing orders.
+      buy_delay: 0 # Delay in milliseconds before executing the buy order.
+      sell_delay: 0
+      buy_slippage: 10.0 # Maximum slippage allowed for the buy order.
+      sell_slippage: 50.0
+      buy_executor: "bloxroute" # Tx executor, can be "rpc" or "bloxroute".
+      max_retries: 5 # Number of retries if the buy order fails.
+      quote_amount: 0.21 # Amount of quote currency to spend.
+      sell_percent: 100.0 # Percentage of the base currency to sell.
+
+      # After holding the token for the hold_time, the bot will
+      # execute the sell order automatically by current price.
+      hold_time: 300000 # Hold time in milliseconds.
+      take_profit: 25.0 # Take profit percentage.
+      stop_loss: 10.0 # Stop loss percentage.
+      take_profit_executor: "rpc"
+      stop_loss_executor: "bloxroute"
+
+      # The bribes are used to incentivize the validators to include the transaction
+      # in the block. It will be used only if Bloxroute is enabled and auth token is provided.
+      buy_bribe: 0.003 # The bribe amount in SOL.
+      sell_bribe: 0.003

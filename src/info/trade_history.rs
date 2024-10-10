@@ -3,13 +3,18 @@ use chrono::NaiveDateTime;
 use dashmap::DashMap;
 use log::info;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use crate::trader;
 use crate::trader::models::Trade;
 
 /// Prints the active trades to the console, trades sorted by created_at timestamp in descending order.
 pub async fn print_trades_history() {
+    let dummy_cancel_token = CancellationToken::new();
     let trades_history: Arc<Mutex<Vec<Trade>>> = Arc::new(Mutex::new(Vec::new()));
-    let backup = trader::backup::Backup::new_for_trades(Arc::new(DashMap::new()));
+    let backup = trader::backup::Backup::new_for_trades(
+        Arc::new(DashMap::new()),
+        dummy_cancel_token,
+    );
     backup.load_trades_history(trades_history.clone()).await;
 
     // Print trade history
@@ -39,7 +44,7 @@ fn format_trade_row(trade: &Trade) -> String {
         .to_string();
 
     format!(
-        "{:<46} | {:<10} | {:<12.8} | {:<12.10} | {:<12.10} | {:<12.2} | {:<14.2} | {:<19}",
+        "{:<46} | {:<10} | {:<12.9} | {:<12.9} | {:<12.9} | {:<12.2} | {:<14.9} | {:<19}",
         trade.pool.pool_address,
         format!("{:?}", trade.status),
         trade.quote_in_amount,

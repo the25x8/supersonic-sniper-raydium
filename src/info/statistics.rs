@@ -4,6 +4,7 @@ use dashmap::DashMap;
 use log::info;
 use solana_program::pubkey::Pubkey;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use crate::trader;
 use crate::trader::models::{OrderKind, Trade};
 
@@ -11,8 +12,12 @@ use crate::trader::models::{OrderKind, Trade};
 /// number of profitable, and number of unprofitable trades.
 pub async fn print_total_stats() {
     // Load trades history
+    let dummy_cancel_token = CancellationToken::new();
     let trades_history: Arc<Mutex<Vec<Trade>>> = Arc::new(Mutex::new(Vec::new()));
-    let backup = trader::backup::Backup::new_for_trades(Arc::new(DashMap::new()));
+    let backup = trader::backup::Backup::new_for_trades(
+        Arc::new(DashMap::new()),
+        dummy_cancel_token,
+    );
     backup.load_trades_history(trades_history.clone()).await;
 
     let trades_history = trades_history.lock().await;

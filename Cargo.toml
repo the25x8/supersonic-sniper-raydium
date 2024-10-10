@@ -21,7 +21,7 @@ serde_json = "1.0.128"
 
 # Asynchronous runtime
 tokio = { version = "1.40.0", features = ["full", "tracing"] }
-tokio-util = { version = "0.7.12", features = ["time"] }
+tokio-util = { version = "0.7.12", features = ["time", "rt"] }
 tungstenite = "0.24.0"
 tokio-tungstenite = { version = "0.24.0", features = ["native-tls"] }
 
@@ -63,5 +63,12 @@ rev = "6105d7a5591aefa646a95d12b5e8d3f55a9214ef"
 git = "https://github.com/solana-labs/curve25519-dalek.git"
 rev = "c14774464c4d38de553c6ef2f48a10982c1b4801"
 
-[build]
-rustflags = ["--cfg", "tokio_unstable"]
+#[build]
+#rustflags = ["--cfg", "tokio_unstable"]
+
+[profile.release]
+opt-level = "z"       # Optimize for size (alternatively use "s" or 3 for speed)
+lto = true            # Enable Link Time Optimization
+codegen-units = 1     # Reduce parallelism in codegen for better optimization
+panic = 'abort'       # Abort on panic to reduce binary size
+strip = true          # Strip debugging symbols to minimize the binary size

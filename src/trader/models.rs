@@ -333,7 +333,11 @@ impl Order {
         delay: u64,
     ) -> Self {
         // Delayed at timestamp is current timestamp + delay if delay is greater than 0.
-        let delayed_at = if delay > 0 { current_timestamp() + delay } else { 0 };
+        let delayed_at = if delay > 0 {
+            current_timestamp() + (delay / 1000)
+        } else {
+            0
+        };
         Self {
             id: Uuid::new_v4(),
             direction,

@@ -6,15 +6,16 @@ use uuid::Uuid;
 use log::info;
 use chrono::{NaiveDateTime};
 use solana_sdk::pubkey::Pubkey;
-
+use tokio_util::sync::CancellationToken;
 use crate::trader::models::{Trade, Order, OrderStatus, OrderKind, TradeStatus};
 use crate::trader::backup::Backup;
 
 pub async fn print_trade_info(query: &str) {
     // Load trades (both active and history)
+    let dummy_cancel_token = CancellationToken::new();
     let trades_history: Arc<Mutex<Vec<Trade>>> = Arc::new(Mutex::new(Vec::new()));
     let active_trades: Arc<DashMap<Pubkey, Vec<Trade>>> = Arc::new(DashMap::new());
-    let backup = Backup::new_for_trades(active_trades.clone());
+    let backup = Backup::new_for_trades(active_trades.clone(), dummy_cancel_token);
     backup.load_trades_history(trades_history.clone()).await;
     backup.load_active_trades().await;
 
@@ -71,8 +72,8 @@ pub async fn print_trade_info(query: &str) {
             📅 Completed At:     {}\n\
             💸 Quote In Amount:  {:.9}\n\
             💵 Quote Out Amount: {:.9}\n\
-            💲 Buy Price:        {:.4}\n\
-            💲 Sell Price:       {:.4}\n\
+            💲 Buy Price:        {:.9}\n\
+            💲 Sell Price:       {:.9}\n\
             📊 Profit Percent:   {:.2}%\n\
             💹 Profit Amount:    {:.9}\n",
             "=".repeat(80),

@@ -14,7 +14,10 @@ use clap::{Arg, ArgAction, Command};
 use log::{error, info};
 use solana_client::nonblocking::rpc_client::{RpcClient};
 use solana_sdk::commitment_config::CommitmentConfig;
-use tokio::sync::mpsc;
+use tokio::signal;
+use tokio::sync::{mpsc};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 #[tokio::main]
 async fn main() {
@@ -23,12 +26,39 @@ async fn main() {
     print_logo();
 
     // Set panic hook to exit the process after printing the panic error
-    let default_panic = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        default_panic(info);
-        std::process::exit(1);
-    }));
+    // let default_panic = std::panic::take_hook();
+    // std::panic::set_hook(Box::new(move |info| {
+    //     default_panic(info);
+    //     std::process::exit(1);
+    // }));
 
+    // Create a new CancellationToken
+    let shutdown_token = CancellationToken::new();
+
+    // Spawn the application task using the tracker and clone the receiver for each task
+    let shutdown_token_clone = shutdown_token.clone();
+    let main_task = tokio::spawn(run_app(shutdown_token_clone));
+
+    // Listen for external Ctrl+C signal or internal shutdown request
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            info!("Ctrl+C signal received. Shutting down the bot...");
+        }
+        _ = shutdown_token.cancelled() => {}
+    }
+
+    // Send shutdown signal to all tasks using the token
+    shutdown_token.cancel();
+
+    // Wait for the main task to complete
+    main_task.await.unwrap();
+
+    // Graceful shutdown of the bot
+    info!("All tasks closed! Bot has been shut down.");
+}
+
+/// Run the bot program based on the provided CLI arguments.
+async fn run_app(shutdown_token: CancellationToken) {
     // Define CLI using Clap
     let matches = Command::new("Supersonic Sniper Bot")
         .version("0.1.0")
@@ -144,22 +174,24 @@ async fn main() {
     // Wrap the RpcClient in an Arc for shared ownership
     let rpc_client_arc = Arc::new(rpc_client);
 
-    // Initialize the detector module (core logic)
-    let detector = detector::Detector::new(
+    // Create task tracker for graceful shutdown of all background tasks.
+    let tracker = TaskTracker::new();
+
+    // Initialize the detector module as a future task
+    let detector_future = detector::Detector::run(
         app_config_arc.clone(),
-        rpc_client_arc.clone(),
         pool_tx,
+        shutdown_token.clone(),
     );
 
-    // Determine which subcommand was used
     match matches.subcommand() {
+        // Run the bot with detector and trader modules
         Some(("run", _)) => {
             info!(
                 "\n\
                 🚀 Supersonic Sniper Bot is initializing...\n\
                 ▶️ Version: v0.1\n\
-                ▶️ Powered by Solana & Rust\n\
-                ───────────────────────────────────────"
+                ───────────────────────────────────────\n"
             );
 
             // Initialize the trader module
@@ -171,18 +203,29 @@ async fn main() {
                 wallet,
                 pool_rx,
                 rpc_ws_url.as_str(),
+                shutdown_token.clone(),
             ).await;
 
-            // Start detector and trader concurrently
-            tokio::join!(
-                detector.start(),
-                trader.start(),
-            );
+            // Start detector and trader tasks
+            tracker.spawn(detector_future);
+            tracker.spawn(async move {
+                trader.start().await;
+            });
         }
+
+        // Run the detector module only
         Some(("detector", _)) => {
-            info!("Starting Super Sonic sniper bot in detector mode...");
-            detector.start().await;
+            info!(
+                "\n\
+                👁️ Detector Module is running...\n\
+                ▶️ Version: v0.1\n\
+                ───────────────────────────────────────\n"
+            );
+
+            tracker.spawn(detector_future);
         }
+
+        // Print information about trades, orders, history, and stats
         Some(("info", sub_m)) => {
             if sub_m.get_flag("active") {
                 info::active_trades::print_active_trades().await;
@@ -195,9 +238,18 @@ async fn main() {
             } else if let Some(query) = sub_m.get_one::<String>("trade") {
                 info::trade::print_trade_info(query).await;
             }
+
+            shutdown_token.cancel(); // Close the app after info is printed
         }
+
         _ => unreachable!(), // If all subcommands are defined above, anything else is unreachable
     }
+
+    // Close the tracker after tasks start
+    tracker.close();
+
+    // Wait for all tasks to complete
+    tracker.wait().await;
 }
 
 fn print_logo() {

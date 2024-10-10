@@ -17,9 +17,10 @@ use futures::StreamExt;
 use solana_account_decoder::parse_token::UiTokenAmount;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_filter::RpcFilterType::DataSize;
-
+use tokio_util::sync::CancellationToken;
 use crate::error::handle_attempt;
 use crate::raydium::{LiquidityStateV4, MainnetProgramId};
+use crate::solana::amount_utils::token_amount_to_float;
 use crate::solana::quote_mint::{USDC_MINT, WSOL_MINT};
 
 // Maximum retry attempts for fetching data from the blockchain
@@ -65,6 +66,9 @@ pub struct MarketMonitor {
     watchlist: Arc<DashSet<Pubkey>>,
     watchlist_update_tx: Sender<Pubkey>,
     prices: Arc<DashMap<Pubkey, (f64, std::time::Instant)>>,
+
+    // For cancelling the market monitor task when the bot is stopped
+    cancel_token: CancellationToken,
 }
 
 impl MarketMonitor {
@@ -72,11 +76,13 @@ impl MarketMonitor {
         rpc_client: Arc<RpcClient>,
         rpc_ws_url: &str,
         market_tx: Sender<MarketData>,
+        cancel_token: CancellationToken,
     ) -> Self {
         // Initialize the Pubsub client instance
         let pubsub_client = match PubsubClient::new(rpc_ws_url).await {
             Ok(client) => client,
             Err(e) => {
+                cancel_token.cancel(); // Gracefully exit the bot
                 panic!("Failed to create WebSocket client: {:?}", e);
             }
         };
@@ -85,22 +91,36 @@ impl MarketMonitor {
         let watchlist = Arc::new(DashSet::new());
         let pubsub_client = Arc::new(pubsub_client);
 
-        let (watchlist_update_tx, watchlist_update_rx) = tokio::sync::mpsc::channel(32);
+        let (watchlist_update_tx, watchlist_update_rx) = tokio::sync::mpsc::channel(50);
         let pubsub_client_clone = pubsub_client.clone();
-        let watchlist_clone = watchlist.clone();
         let prices_clone = prices.clone();
 
-        // Run the main market monitor task in the background
+        // Run the watchlist update task
         let market_data_tx = market_tx.clone();
         let rpc_client_clone = rpc_client.clone();
+        let watchlist_clone = watchlist.clone();
+        tokio::spawn(async move {
+            Self::watchlist_update_loop(
+                watchlist_update_rx,
+                watchlist_clone,
+                market_data_tx,
+                rpc_client_clone,
+            ).await;
+        });
+
+        // Run the main market monitor task
+        let market_data_tx = market_tx.clone();
+        let rpc_client_clone = rpc_client.clone();
+        let watchlist_clone = watchlist.clone();
+        let cancel_token_clone = cancel_token.clone();
         tokio::spawn(async move {
             Self::run(
                 rpc_client_clone,
                 pubsub_client_clone,
                 market_data_tx,
-                watchlist_update_rx,
                 watchlist_clone,
                 prices_clone,
+                cancel_token_clone,
             ).await;
         });
 
@@ -110,7 +130,97 @@ impl MarketMonitor {
             market_tx,
             rpc_client,
             pubsub_client,
+            cancel_token,
             watchlist_update_tx,
+        }
+    }
+
+    /// Run tasks for updating the watchlist and fetching initial market data for pools.
+    async fn watchlist_update_loop(
+        mut watchlist_update_rx: Receiver<Pubkey>,
+        watchlist: Arc<DashSet<Pubkey>>,
+        market_tx: Sender<MarketData>,
+        rpc_client: Arc<RpcClient>,
+    ) {
+        while let Some(pubkey) = watchlist_update_rx.recv().await {
+            // Add the pool to the watchlist if it doesn't exist
+            let is_add = !watchlist.contains(&pubkey);
+            if is_add {
+                watchlist.insert(pubkey);
+                info!("🔍 Pool {} added to watchlist", pubkey);
+                // watchlist lock is dropped here
+            } else {
+                // Otherwise, remove the pool from the watchlist
+                watchlist.remove(&pubkey);
+                info!("🔍 Pool {} removed from watchlist", pubkey);
+                continue;
+            }
+
+            // If the pool is being added to the watchlist, fetch the initial market data
+            // Fetch pool data by pubkey
+            let data = match rpc_client.get_account_data(&pubkey).await {
+                Ok(data) => data,
+                Err(e) => {
+                    error!("Failed to fetch account data for pool {}: {}", pubkey, e);
+                    continue;
+                }
+            };
+
+            // Deserialize the account data into a liquidity state
+            let mut state = match LiquidityStateV4::try_from_slice(&data) {
+                Ok(state) => state,
+                Err(e) => {
+                    error!("Failed to parse liquidity state v4 data: {}", e);
+                    continue;
+                }
+            };
+
+            // Prevent the base token from being USDC or WSOL
+            if state.coin_vault_mint.to_string() == USDC_MINT ||
+                state.coin_vault_mint.to_string() == WSOL_MINT {
+                swap_vaults(&mut state);
+            }
+
+            // Fetch the initial price of the pool and emit to the market_tx channel
+            let (base_reserves, quote_reserves) = match get_amm_pool_reserves(
+                rpc_client.clone(),
+                &state.coin_vault,
+                &state.pc_vault,
+            ).await {
+                Ok(reserves) => (reserves[0].clone(), reserves[1].clone()),
+                Err(e) => {
+                    error!("Failed to fetch initial AMM pool reserves: {}", e);
+                    continue;
+                }
+            };
+
+            // Calculate the initial price of the pool
+            let price = match convert_reserves_to_price(&base_reserves, &quote_reserves) {
+                Ok(price) => price,
+                Err(e) => {
+                    error!("Failed to calculate initial token price: {}", e);
+                    continue;
+                }
+            };
+
+            // Emit the initial market data to the market_tx channel
+            let scaled_base_reserves = token_amount_to_float(&base_reserves.amount, base_reserves.decimals);
+            let scaled_quote_reserves = token_amount_to_float(&quote_reserves.amount, quote_reserves.decimals);
+            match market_tx.send(MarketData {
+                price,
+                market: pubkey,
+                base_reserves: scaled_base_reserves,
+                quote_reserves: scaled_quote_reserves,
+                timestamp: std::time::Instant::now(),
+            }).await {
+                Ok(_) => (),
+                Err(e) => {
+                    error!("Failed to send initial market data: {}", e);
+                    continue;
+                }
+            }
+
+            continue; // Skip the rest of the loop
         }
     }
 
@@ -118,32 +228,12 @@ impl MarketMonitor {
         rpc_client: Arc<RpcClient>,
         pubsub: Arc<PubsubClient>,
         market_tx: Sender<MarketData>,
-        mut watchlist_update_rx: Receiver<Pubkey>,
         watchlist: Arc<DashSet<Pubkey>>,
         prices: Arc<DashMap<Pubkey, (f64, std::time::Instant)>>,
+        cancel_token: CancellationToken,
     ) {
         // Clone the Pubsub client instance
         let mut attempts = 0;
-
-        // Task to update the watchlist with new pools.
-        // To remove a pool from the watchlist, send the pool
-        // pubkey to the watchlist_update_tx channel. If the pool
-        // is new, it will be added to the watchlist.
-        let watchlist_clone = watchlist.clone();
-        tokio::spawn(async move {
-            while let Some(pubkey) = watchlist_update_rx.recv().await {
-                // Only acquire a write lock if the pool isn't already in the watchlist
-                if !watchlist_clone.contains(&pubkey) {
-                    watchlist_clone.insert(pubkey);
-                    info!("🔍 Pool {} added to watchlist", pubkey);
-                    continue;
-                }
-
-                // Otherwise, remove the pool from the watchlist
-                watchlist_clone.remove(&pubkey);
-                info!("🔍 Pool {} removed from watchlist", pubkey);
-            }
-        });
 
         loop {
             // Combine the custom filters with common filters
@@ -181,7 +271,7 @@ impl MarketMonitor {
             };
 
             // Subscribe to the AMM program
-            let (mut accounts, _unsubscribe) = match pubsub.program_subscribe(
+            let (mut accounts, program_unsubscribe) = match pubsub.program_subscribe(
                 &MainnetProgramId::AmmV4.get_pubkey(),
                 Some(config),
             ).await {
@@ -206,44 +296,55 @@ impl MarketMonitor {
             // Reset the connection attempts counter
             attempts = 0;
 
-            // Set the start timestamp when the subscription is successful
-            let start_timestamp = Utc::now();
+            tokio::select! {
+                // Handle the program subscription stream
+                _ = async {
+                    info!(
+                        "\n\
+                        📡 Market Monitor Status\n\
+                        ▶️ Subscribed to Solana AMM Program\n\
+                        ───────────────────────────────────────"
+                    );
 
-            info!(
-                "\n\
-                📡 Market Monitor Status\n\
-                ▶️ Subscribed to Solana AMM Program\n\
-                ───────────────────────────────────────"
-            );
+                    // Process account updates
+                    while let Some(response) = accounts.next().await {
+                        // Read public key of amm pool
+                        let pubkey = match Pubkey::from_str(&response.value.pubkey) {
+                            Ok(pk) => pk,
+                            Err(e) => {
+                                error!("Failed to parse pool pubkey: {}", e);
+                                continue;
+                            }
+                        };
 
-            // Process account updates
-            while let Some(response) = accounts.next().await {
-                // Read public key of amm pool
-                let pubkey = match Pubkey::from_str(&response.value.pubkey) {
-                    Ok(pk) => pk,
-                    Err(e) => {
-                        error!("Failed to parse pool pubkey: {}", e);
-                        continue;
+                        // Handle the account update in a separate task
+                        let rpc_client = rpc_client.clone();
+                        let market_tx = market_tx.clone();
+                        let prices = prices.clone();
+                        let watchlist = watchlist.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = Self::handle_account_update(
+                                pubkey,
+                                &response.value.account.data,
+                                rpc_client.clone(),
+                                prices.clone(),
+                                watchlist.clone(),
+                                market_tx.clone(),
+                            ).await {
+                                error!("Failed to handle account update: {}", e);
+                            }
+                        });
                     }
-                };
+                } => {}
 
-                // Handle the account update in a separate task
-                let rpc_client = rpc_client.clone();
-                let market_tx = market_tx.clone();
-                let prices = prices.clone();
-                let watchlist = watchlist.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = Self::handle_account_update(
-                        pubkey,
-                        &response.value.account.data,
-                        rpc_client.clone(),
-                        prices.clone(),
-                        watchlist.clone(),
-                        market_tx.clone(),
-                    ).await {
-                        error!("Failed to handle account update: {}", e);
-                    }
-                });
+                // Unsubscribe from the program subscription and exit the task if cancelled
+                _ = cancel_token.cancelled() => {
+                    info!("Unsubscribing from Raydium pool stream in Market Monitor...");
+                    program_unsubscribe().await;
+                    break;
+                }
+
+                else => break,
             }
 
             // Wait before retrying to avoid busy looping
@@ -256,12 +357,14 @@ impl MarketMonitor {
                 RECONNECT_BACKOFF,
             ).await {
                 error!("Max reconnection retries for Raydium pool stream exceeded");
+                cancel_token.cancel(); // Gracefully exit the bot
                 break;
             }
         }
 
-        // If the subscription task has exited, terminate the bot
-        panic!("Market monitor task has exited unexpectedly, terminating...");
+        // Cancel the token
+        error!("Market Monitor task has been terminated, the bot is stopping...");
+        cancel_token.cancel();
     }
 
     /// Add a pool to the watchlist
@@ -313,23 +416,10 @@ impl MarketMonitor {
                         }
                     }
 
-                    // Swap the vaults if the coin vault is USDC or WSOL.
-                    // Because the coin vault is the base token and the pc vault is the quote token,
-                    // we need to ensure that the base token is not USDC or WSOL.
+                    // Prevent the base token from being USDC or WSOL
                     if state.coin_vault_mint.to_string() == USDC_MINT ||
                         state.coin_vault_mint.to_string() == WSOL_MINT {
-                        let temp_mint = state.coin_vault_mint;
-                        let temp_vault = state.coin_vault;
-                        let temp_decimals = state.pc_decimals;
-
-                        // Swap the values
-                        state.coin_vault_mint = state.pc_vault_mint;
-                        state.coin_vault = state.pc_vault;
-                        state.coin_decimals = state.pc_decimals;
-
-                        state.pc_vault_mint = temp_mint;
-                        state.pc_vault = temp_vault;
-                        state.pc_decimals = temp_decimals;
+                        swap_vaults(&mut state);
                     }
 
                     // Step 3: Fetch the reserves of the AMM pool if cache is stale or empty
@@ -392,6 +482,23 @@ impl MarketMonitor {
             }
         }
     }
+}
+
+/// Sometimes the coin vault is USDC or WSOL, which means the base token is the quote token.
+/// In this case, we need to swap the vaults to ensure the base token is not USDC or WSOL.
+fn swap_vaults(state: &mut LiquidityStateV4) {
+    let temp_mint = state.coin_vault_mint;
+    let temp_vault = state.coin_vault;
+    let temp_decimals = state.pc_decimals;
+
+    // Swap the values
+    state.coin_vault_mint = state.pc_vault_mint;
+    state.coin_vault = state.pc_vault;
+    state.coin_decimals = state.pc_decimals;
+
+    state.pc_vault_mint = temp_mint;
+    state.pc_vault = temp_vault;
+    state.pc_decimals = temp_decimals;
 }
 
 pub async fn get_amm_pool_reserves(

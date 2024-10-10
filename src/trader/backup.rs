@@ -8,6 +8,7 @@ use log::{debug, error, info, warn};
 use solana_sdk::pubkey::Pubkey;
 use tokio::sync::{Mutex};
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use crate::trader::{Order, Trade};
 
 /// Backup is a module that periodically saves the trader memory state to disk.
@@ -20,20 +21,27 @@ pub struct Backup {
     pending_orders_file_mutex: Arc<Mutex<()>>,
 
     active_trades: Arc<DashMap<Pubkey, Vec<Trade>>>, // Reference to the trades history
-    pending_orders: Arc<DashMap<Pubkey, Order>>, // Reference to the pending orders
+    pending_orders: Arc<DashMap<Pubkey, Vec<Order>>>, // Reference to the pending orders
 
     // Backup file paths
     active_trades_path: String,
     trades_history_path: String,
     pending_orders_path: String,
+
+    // Cancellation token for sync data on shutdown
+    cancel_token: CancellationToken,
 }
 
 impl Backup {
     /// Trades backup constructor with a reference to the trades in Trader module.
-    pub fn new_for_trades(active_trades: Arc<DashMap<Pubkey, Vec<Trade>>>) -> Self {
+    pub fn new_for_trades(
+        active_trades: Arc<DashMap<Pubkey, Vec<Trade>>>,
+        cancel_token: CancellationToken,
+    ) -> Self {
         // Start a background task to periodically save the trader state to disk
         let path = "./data/active_trades.json";
         Self {
+            cancel_token,
             active_trades,
             pending_orders: Arc::new(DashMap::new()), // empty for trades
             active_trades_path: path.to_string(),
@@ -46,10 +54,14 @@ impl Backup {
     }
 
     /// Executed orders backup constructor with a reference to the pending orders in Executor module.
-    pub fn new_for_pending_orders(pending_orders: Arc<DashMap<Pubkey, Order>>) -> Self {
+    pub fn new_for_pending_orders(
+        pending_orders: Arc<DashMap<Pubkey, Vec<Order>>>,
+        cancel_token: CancellationToken,
+    ) -> Self {
         // Start a background task to periodically save the executor state to disk
         let path = "./data/pending_orders.json";
         Self {
+            cancel_token,
             pending_orders,
             active_trades: Arc::new(DashMap::new()), // empty for orders
             active_trades_path: "".to_string(),
@@ -61,19 +73,43 @@ impl Backup {
         }
     }
 
-    pub async fn start_trades_save(&self) {
+    /// Trades auto sync task that periodically saves the active trades to disk.
+    /// It also saves the trades on shutdown.
+    pub async fn trades_auto_sync(&self) {
         loop {
-            tokio::time::sleep(Duration::from_secs(8)).await;
-            self.save_active_trades().await;
-            debug!("Periodic sync of active trades to disk completed");
+            tokio::select! {
+                // Periodically save the active trades to disk
+                _ = tokio::time::sleep(Duration::from_secs(8)) => {
+                    self.save_active_trades().await;
+                    debug!("Periodic sync of active trades to disk");
+                }
+                
+                // Before shutdown, save the active trades to disk
+                _ = self.cancel_token.cancelled() => {
+                    self.save_active_trades().await;
+                    break;
+                }
+            }
         }
     }
 
-    pub async fn start_orders_save(&self) {
+    /// Pending orders auto sync task that periodically saves the pending orders to disk.
+    /// It also saves the orders on shutdown.
+    pub async fn pending_auto_sync(&self) {
         loop {
-            tokio::time::sleep(Duration::from_secs(8)).await;
-            self.save_pending_orders().await;
-            debug!("Periodic sync of pending orders to disk completed");
+            tokio::select! {
+                // Periodically save the pending orders to disk
+                _ = tokio::time::sleep(Duration::from_secs(8)) => {
+                    self.save_pending_orders().await;
+                    debug!("Periodic sync of pending orders to disk completed");
+                }
+                
+                // Before shutdown, save the pending orders to disk
+                _ = self.cancel_token.cancelled() => {
+                    self.save_pending_orders().await;
+                    break;
+                }
+            }
         }
     }
 
@@ -276,7 +312,7 @@ impl Backup {
                         error!("Failed to read {}: {}", path, e);
                         return;
                     }
-                    match serde_json::from_str::<HashMap<String, Order>>(&data) {
+                    match serde_json::from_str::<HashMap<String, Vec<Order>>>(&data) {
                         Ok(parsed_orders) => {
                             if parsed_orders.len() > 0 {
                                 info!("Loaded {} pending orders from {}", parsed_orders.len(), path);

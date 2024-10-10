@@ -16,7 +16,7 @@
 
 - Rust (stable version 2021 or later)
 - Solana CLI installed and configured
-- Raydium account and necessary wallets set up
+- Solana wallets set up
 
 ### Installation
 
@@ -46,3 +46,66 @@ cargo run -- --pair <pair_address>
 ```
 
 This `README.md` provides a high-level overview of the bot and how to get started. As we add features, we'll keep updating this documentation.
+
+### Build
+
+To build the project for your current platform, run:
+```bash
+cargo build --release
+```
+
+If you want to further analyze the binary size, you can use cargo bloat:
+```bash
+cargo install cargo-bloat
+cargo bloat --release --crates
+```
+
+Once you've built the release version, you can inspect the size of the binary:
+```bash
+ls -lh target/release/supersonic-sniper-bot
+```
+
+This will show a breakdown of which crates are contributing the most to the size of the binary.
+
+#### Cross-Compile for Windows from macOS
+First, install the appropriate target:
+
+For GNU ABI (easier for cross-compilation from non-Windows platforms):
+```bash
+rustup target add x86_64-pc-windows-gnu
+cargo build --release --target x86_64-pc-windows-gnu
+```
+
+> If you're cross-compiling for MSVC (Microsoft Visual Studio ABI), you'll need to use x86_64-pc-windows-msvc, but this typically requires additional tooling like wine or a Windows system for linking.
+
+#### Compile for Linux from macOS
+To cross-compile for Linux from macOS, use the x86_64-unknown-linux-gnu target:
+```bash
+rustup target add x86_64-unknown-linux-gnu
+cargo build --release --target x86_64-unknown-linux-gnu
+```
+
+For fully statically linked binaries on Linux (useful when deploying to minimal systems), you can target musl:
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+Install the mingw-w64 toolchain for cross-compiling to Windows from macOS.
+```bash
+brew install mingw-w64
+```
+
+After installation, you can build for Windows using:
+```bash
+CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc cargo build --release --target x86_64-pc-windows-gnu
+```
+
+### Benchmarking Production Build
+After creating your optimized build, you can benchmark its performance using tools like hyperfine:
+```bash
+cargo install hyperfine
+hyperfine target/release/supersonic-sniper-bot -- --config config/default.yml
+```
+
+This will give you insights into the runtime performance of your optimized binary.
