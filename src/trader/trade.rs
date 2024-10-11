@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::config::StrategyConfig;
 use crate::detector::Pool;
+use crate::executor::order::{Order, OrderKind, OrderStatus};
 use crate::trader::current_timestamp;
 
 /// Trade is the main representation of work in the Trader module.
@@ -130,7 +131,6 @@ impl Trade {
         in_amount: f64, // In amount is the amount of base tokens
         out_amount: f64, // Out amount is the amount of quote tokens
         tx_id: String,
-        signature: String,
         timestamp: u64,
     ) -> Result<(), String> {
         // Skip if the trade is already completed or cancelled
@@ -182,7 +182,6 @@ impl Trade {
 
         // Assign the blockchain tx details and timestamps
         sell_order.tx_id = Some(tx_id);
-        sell_order.signature = Some(signature);
         sell_order.status = OrderStatus::Completed;
         sell_order.confirmed_at = timestamp;
 
@@ -196,7 +195,6 @@ impl Trade {
         in_amount: f64, // In amount is the amount of quote tokens
         out_amount: f64, // Out amount is the amount of base tokens
         tx_id: String,
-        signature: String,
         timestamp: u64,
     ) {
         self.buy_price = in_amount / out_amount; // Formula: quote_token_amount / base_token_amount
@@ -209,7 +207,6 @@ impl Trade {
         if let Some(buy_order) = self.buy_order.as_mut() {
             buy_order.status = OrderStatus::Completed;
             buy_order.tx_id = Some(tx_id);
-            buy_order.signature = Some(signature);
             buy_order.confirmed_at = timestamp;
         }
     }
@@ -230,9 +227,7 @@ impl Trade {
         let completed_order_id = completed_order.unwrap().id;
 
         // If hold time order exists and it is not the completed order, cancel it
-        let mut hold_time_order = self.hold_time_order.clone();
-        if hold_time_order.is_some() {
-            let hold_time_order = hold_time_order.as_mut().unwrap();
+        if let Some(hold_time_order) = self.hold_time_order.as_mut() {
             if hold_time_order.id != completed_order_id {
                 hold_time_order.status = OrderStatus::Cancelled;
                 hold_time_order.cancelled_at = current_timestamp();
@@ -240,9 +235,7 @@ impl Trade {
         }
 
         // If take profit order exists and it is not the completed order, cancel it
-        let mut take_profit_order = self.take_profit_order.clone();
-        if take_profit_order.is_some() {
-            let take_profit_order = take_profit_order.as_mut().unwrap();
+        if let Some(take_profit_order) = self.take_profit_order.as_mut() {
             if take_profit_order.id != completed_order_id {
                 take_profit_order.status = OrderStatus::Cancelled;
                 take_profit_order.cancelled_at = current_timestamp();
@@ -250,9 +243,7 @@ impl Trade {
         }
 
         // If stop loss order exists and it is not the completed order, cancel it
-        let mut stop_loss_order = self.stop_loss_order.clone();
-        if stop_loss_order.is_some() {
-            let stop_loss_order = stop_loss_order.as_mut().unwrap();
+        if let Some(stop_loss_order) = self.stop_loss_order.as_mut() {
             if stop_loss_order.id != completed_order_id {
                 stop_loss_order.status = OrderStatus::Cancelled;
                 stop_loss_order.cancelled_at = current_timestamp();
@@ -291,142 +282,6 @@ impl fmt::Display for TradeStatus {
             TradeStatus::Active => write!(f, "Active"),
             TradeStatus::Cancelled => write!(f, "Cancelled"),
             TradeStatus::Completed => write!(f, "Completed"),
-        }
-    }
-}
-
-/// The orders are the main building blocks of the trade.
-/// Each trade consists of a buy order and one or more sell orders.
-/// The order provides abstract fields to contain to swap in and out
-/// amounts, slippage, delay, and other details.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Order {
-    pub id: Uuid,
-    pub pool: Pubkey, // The pool address is a main key for the order
-    pub trade_id: Uuid, // The trade ID associated with the order
-    pub direction: OrderDirection,
-    pub status: OrderStatus,
-    pub kind: OrderKind,
-    pub delay: u64, // Delay in milliseconds before executing the order
-
-    // Swap fields are the same for swapIn and swapOut orders
-    pub amount_in: f64,
-    pub min_amount_out: f64,
-
-    // Blockchain tx details and timestamps
-    pub tx_id: Option<String>,
-    pub signature: Option<String>,
-    pub confirmed_at: u64,
-    pub cancelled_at: u64,
-    pub created_at: u64,
-    pub delayed_at: u64, // Timestamp when the order is delayed
-}
-
-impl Order {
-    pub fn new(
-        direction: OrderDirection,
-        trade_id: Uuid,
-        kind: OrderKind,
-        pool: Pubkey,
-        amount_in: f64,
-        min_amount_out: f64,
-        delay: u64,
-    ) -> Self {
-        // Delayed at timestamp is current timestamp + delay if delay is greater than 0.
-        let delayed_at = if delay > 0 {
-            current_timestamp() + (delay / 1000)
-        } else {
-            0
-        };
-        Self {
-            id: Uuid::new_v4(),
-            direction,
-            pool,
-            delay,
-            kind,
-            amount_in,
-            trade_id,
-            min_amount_out,
-            delayed_at,
-            tx_id: None,
-            signature: None,
-            confirmed_at: 0,
-            cancelled_at: 0,
-            status: OrderStatus::Open,
-            created_at: current_timestamp(),
-        }
-    }
-
-    pub fn update_status(&mut self, status: OrderStatus) {
-        self.status = status;
-        match status {
-            OrderStatus::Completed => self.confirmed_at = current_timestamp(),
-            OrderStatus::Cancelled => self.cancelled_at = current_timestamp(),
-            _ => {}
-        }
-    }
-}
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum OrderKind {
-    SimpleBuy = 1,
-    HoldTime = 2,
-    TakeProfit = 3,
-    StopLoss = 4,
-}
-
-impl fmt::Display for OrderKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            OrderKind::SimpleBuy => write!(f, "SimpleBuy"),
-            OrderKind::HoldTime => write!(f, "HoldTime"),
-            OrderKind::TakeProfit => write!(f, "TakeProfit"),
-            OrderKind::StopLoss => write!(f, "StopLoss"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum OrderDirection {
-    BaseIn,
-    BaseOut,
-}
-
-impl OrderDirection {
-    pub fn value(&self) -> String {
-        match *self {
-            OrderDirection::BaseIn => "base_in".to_string(),
-            OrderDirection::BaseOut => "base_out".to_string(),
-        }
-    }
-}
-
-impl fmt::Display for OrderDirection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            OrderDirection::BaseIn => write!(f, "BaseIn"),
-            OrderDirection::BaseOut => write!(f, "BaseOut"),
-        }
-    }
-}
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum OrderStatus {
-    Open = 1,
-    Completed = 2,
-    Cancelled = 3,
-    Expired = 4,
-}
-
-impl fmt::Display for OrderStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            OrderStatus::Open => write!(f, "Open"),
-            OrderStatus::Completed => write!(f, "Completed"),
-            OrderStatus::Cancelled => write!(f, "Cancelled"),
-            OrderStatus::Expired => write!(f, "Expired"),
         }
     }
 }

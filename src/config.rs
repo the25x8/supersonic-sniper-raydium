@@ -161,13 +161,36 @@ pub struct StrategyConfig {
     pub stop_loss: f64, // Stop loss percentage.
 
     // You can specify the separate executors for take profit and stop loss.
-    pub take_profit_executor: String,
-    pub stop_loss_executor: Option<String>,
+    pub take_profit_executor: ExecutorType,
+    pub stop_loss_executor: Option<ExecutorType>,
 
     // The bribes are used to incentivize the validators to include the transaction
     // in the block. It will be used only if Bloxroute is enabled and auth token is provided.
     pub buy_bribe: Option<f64>, // Amount in SOL
     pub sell_bribe: Option<f64>, // Amount in SOL
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub enum ExecutorType {
+    RPC,
+    Bloxroute,
+}
+
+impl ExecutorType {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ExecutorType::RPC => "rpc",
+            ExecutorType::Bloxroute => "bloxroute"
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "rpc" => Some(ExecutorType::RPC),
+            "bloxroute" => Some(ExecutorType::Bloxroute),
+            _ => None
+        }
+    }
 }
 
 /// Loads the application configuration from a specified file and overlays it with environment variables.

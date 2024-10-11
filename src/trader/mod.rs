@@ -1,9 +1,8 @@
-mod executor;
 mod market_monitor;
 pub mod backup;
-pub mod models;
+pub mod trade;
 
-use std::collections::{HashMap};
+use std::collections::HashMap;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -15,18 +14,19 @@ use solana_program::program_option::COption;
 use solana_program::program_pack::Pack;
 use mpl_token_metadata::accounts::Metadata;
 use solana_account_decoder::parse_token::UiTokenAmount;
-use spl_token::state::{Mint};
-use tokio::sync::mpsc::{Receiver};
-use tokio::sync::{Semaphore};
+use spl_token::state::Mint;
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
-use crate::config::{StrategyConfig, TraderConfig};
+use crate::config::{ExecutorType, StrategyConfig, TraderConfig};
 use crate::detector::{Pool, PoolType};
 use crate::solana::amount_utils::token_amount_to_float;
 use crate::solana::quote_mint::{USDC_MINT, WSOL_MINT};
-use crate::trader::executor::Executor;
-use crate::trader::market_monitor::{get_amm_pool_reserves, convert_reserves_to_price, MarketData, MarketMonitor};
-use crate::trader::backup::{Backup};
-use crate::trader::models::{TradeExchange, OrderStatus, Trade, TradeStatus, Order, OrderDirection, OrderKind};
+use crate::executor::Executor;
+use crate::executor::order::{Order, OrderDirection, OrderKind, OrderStatus};
+use crate::trader::market_monitor::{convert_reserves_to_price, get_amm_pool_reserves, MarketData, MarketMonitor};
+use crate::trader::backup::Backup;
+use crate::trader::trade::{Trade, TradeExchange};
 use crate::wallet::Wallet;
 
 
@@ -78,7 +78,7 @@ impl Trader {
         let active_trades = Arc::new(DashMap::new());
 
         // Initialize the backup helper and load the initial active trades from disk
-        let backup = Arc::new(Backup::new_for_trades(
+        let backup = Arc::new(Backup::new(
             active_trades.clone(),
             cancel_token.clone(),
         ));
@@ -443,78 +443,101 @@ impl Trader {
         match order.direction {
             // Process buy order
             OrderDirection::BaseIn => {
+                // Check that order tx_id is not None
+                if order.tx_id.is_none() {
+                    warn!("Received buy order without tx_id");
+                    return;
+                }
+
                 // Re-acquire the lock to update the trade with buy details
                 if let Some(mut trades_ref) = trades.get_mut(&pool_pubkey) {
                     if let Some(trade_in_map) = trades_ref.value_mut().iter_mut().find(|t| t.id == trade.id) {
                         trade_in_map.buy(
                             order.amount_in,
                             estimated_amount_out,
-                            "dummy_tx_id".to_string(),
-                            "dummy_signature".to_string(),
+                            order.tx_id.unwrap(),
                             current_timestamp(),
                         );
                     }
                     // trades_ref mutable reference is dropped here
                 }
 
-                let mut next_orders = vec![];
+                // Register the new orders for the trade (before executing)
+                let mut hold_time_order: Option<Order> = None;
+                if let Some(mut trades_ref) = trades.get_mut(&pool_pubkey) {
+                    if let Some(trade_in_map) = trades_ref.value_mut().iter_mut().find(|t| t.id == trade.id) {
+                        // Determine the possible sell orders based on the strategy.
+                        let possible_sell_orders = vec![
+                            (
+                                trade.strategy.hold_time > 0,
+                                Order::new(
+                                    OrderDirection::BaseOut,
+                                    trade.id,
+                                    OrderKind::HoldTime,
+                                    &pool_pubkey,
+                                    &trade.pool.base_mint,
+                                    &trade.pool.quote_mint,
+                                    estimated_amount_out,
+                                    estimated_amount_out - (estimated_amount_out * (trade.strategy.sell_slippage / 100.0)),
+                                    ExecutorType::RPC,
+                                    trade.strategy.hold_time,
+                                ),
+                            ),
+                            (
+                                trade.strategy.take_profit > 0.0,
+                                Order::new(
+                                    OrderDirection::BaseOut,
+                                    trade.id,
+                                    OrderKind::TakeProfit,
+                                    &pool_pubkey,
+                                    &trade.pool.base_mint,
+                                    &trade.pool.quote_mint,
+                                    estimated_amount_out,
+                                    estimated_amount_out - (estimated_amount_out * (trade.strategy.sell_slippage / 100.0)),
+                                    ExecutorType::RPC,
+                                    trade.strategy.sell_delay,
+                                ),
+                            ),
+                            (
+                                trade.strategy.stop_loss > 0.0,
+                                Order::new(
+                                    OrderDirection::BaseOut,
+                                    trade.id,
+                                    OrderKind::StopLoss,
+                                    &pool_pubkey,
+                                    &trade.pool.base_mint,
+                                    &trade.pool.quote_mint,
+                                    estimated_amount_out,
+                                    estimated_amount_out - (estimated_amount_out * (trade.strategy.sell_slippage / 100.0)),
+                                    ExecutorType::RPC,
+                                    trade.strategy.sell_delay,
+                                ),
+                            )
+                        ];
 
-                // Schedule sell by hold time order if the strategy has hold time
-                if trade.strategy.hold_time > 0 {
-                    next_orders.push(Order::new(
-                        OrderDirection::BaseOut,
-                        trade.id,
-                        OrderKind::HoldTime,
-                        pool_pubkey,
-                        estimated_amount_out,
-                        estimated_amount_out - (estimated_amount_out * (trade.strategy.sell_slippage / 100.0)),
-                        trade.strategy.hold_time,
-                    ));
-                }
-
-                // Schedule take profit and stop loss orders if the strategy has them
-                if trade.strategy.take_profit > 0.0 {
-                    next_orders.push(Order::new(
-                        OrderDirection::BaseOut,
-                        trade.id,
-                        OrderKind::TakeProfit,
-                        pool_pubkey,
-                        estimated_amount_out,
-                        estimated_amount_out - (estimated_amount_out * (trade.strategy.sell_slippage / 100.0)),
-                        trade.strategy.sell_delay,
-                    ));
-                }
-
-                if trade.strategy.stop_loss > 0.0 {
-                    next_orders.push(Order::new(
-                        OrderDirection::BaseOut,
-                        trade.id,
-                        OrderKind::StopLoss,
-                        pool_pubkey,
-                        estimated_amount_out,
-                        estimated_amount_out - (estimated_amount_out * (trade.strategy.sell_slippage / 100.0)),
-                        trade.strategy.sell_delay,
-                    ));
-                }
-
-                // Register the new orders for the trade and execute them
-                for order in next_orders.clone() {
-                    if let Some(mut trades_ref) = trades.get_mut(&pool_pubkey) {
-                        if let Some(trade_in_map) = trades_ref.value_mut().iter_mut().find(|t| t.id == trade.id) {
-                            if let Err(e) = trade_in_map.initiate_sell(order.clone()) {
-                                error!("Failed to register take profit order: {}", e);
-                                return;
+                        // Execute the orders where the condition is true
+                        for (condition, order) in possible_sell_orders {
+                            if condition {
+                                let kind = order.kind;
+                                match trade_in_map.initiate_sell(order) {
+                                    Ok(_) => (),
+                                    Err(e) => {
+                                        error!("Failed to schedule {} order: {}", kind, e);
+                                    }
+                                }
                             }
                         }
-                        // trades_ref mutable reference is dropped here
+
+                        // Copy hold time order for execution
+                        hold_time_order = trade.hold_time_order;
                     }
+                    // trades_ref mutable reference is dropped here
                 }
 
-                // Execute only hold time orders immediately, stop loss and take profit
-                // will be executed by the market monitor based on the price.
-                if trade.strategy.hold_time > 0 && next_orders.len() > 0 {
+                // If hold time is set, execute the hold order immediately
+                if trade.strategy.hold_time > 0 && !hold_time_order.is_none() {
                     // Hold order is the first order in the list
-                    if let Err(e) = executor.order(next_orders[0].clone()).await {
+                    if let Err(e) = executor.order(hold_time_order.unwrap()).await {
                         error!("Failed to schedule sell order: {}", e);
                         return;
                     }
@@ -531,6 +554,12 @@ impl Trader {
                 let mut is_completed = false;
                 let mut trade_copy: Option<Trade> = None;
 
+                // Confirm that the order tx_id is not None
+                if order.tx_id.is_none() {
+                    warn!("Received sell order without tx_id");
+                    return;
+                }
+
                 // Re-acquire the lock to update the trade
                 if let Some(mut trades_ref) = trades.get_mut(&pool_pubkey) {
                     if let Some(trade_in_map) = trades_ref.value_mut().iter_mut().find(|t| t.id == trade.id) {
@@ -539,8 +568,7 @@ impl Trader {
                             order.kind,
                             order.amount_in,
                             estimated_amount_out,
-                            "dummy_tx_id".to_string(),
-                            "dummy_signature".to_string(),
+                            order.tx_id.unwrap(),
                             current_timestamp(),
                         ) {
                             error!("Failed to confirm sell order: {}", e);
@@ -837,9 +865,12 @@ impl Trader {
             OrderDirection::BaseIn,
             trade.id,
             OrderKind::SimpleBuy,
-            trade.pool.pubkey,
+            &trade.pool.pubkey,
+            &trade.pool.quote_mint, // spend quote token
+            &trade.pool.base_mint, // buy base token
             amount_in,
             min_amount_out,
+            ExecutorType::Bloxroute,
             trade.strategy.buy_delay,
         );
 
@@ -1077,7 +1108,7 @@ impl Trader {
     }
 }
 
-fn current_timestamp() -> u64 {
+pub fn current_timestamp() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

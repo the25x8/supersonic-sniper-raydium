@@ -6,6 +6,7 @@ mod raydium;
 mod error;
 mod info;
 mod solana;
+mod executor;
 
 use detector::Pool;
 

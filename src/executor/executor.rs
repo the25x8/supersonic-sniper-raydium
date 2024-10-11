@@ -4,23 +4,22 @@ use chrono::Utc;
 use dashmap::DashMap;
 use futures::StreamExt;
 use solana_client::nonblocking::rpc_client::RpcClient;
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use solana_program::pubkey::Pubkey;
-use tokio::sync::mpsc::{Sender};
+use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tokio_util::time::DelayQueue;
-use crate::trader::backup::Backup;
+use crate::config::ExecutorType;
+use crate::executor::order::{Order, OrderDirection, OrderStatus};
+use crate::executor::backup::Backup;
+use crate::executor::{bloxroute, swap_tx};
 use crate::wallet::Wallet;
-use crate::trader::models::{Order, OrderStatus};
 
 // Maximum retry attempts for sending transactions to the blockchain
 const MAX_TX_RETRIES: u32 = 5;
 
 pub struct Executor {
-    client: Arc<RpcClient>,
-    wallet: Arc<Wallet>,
-
     // Delay queue for scheduling orders
     delay_queue_tx: Sender<Order>,
 
@@ -42,7 +41,7 @@ impl Executor {
 
         // Initialize the backup helper and load the pending orders from disk
         let pending_orders: Arc<DashMap<Pubkey, Vec<Order>>> = Arc::new(DashMap::new());
-        let backup = Arc::new(Backup::new_for_pending_orders(
+        let backup = Arc::new(Backup::new(
             pending_orders.clone(),
             cancel_token.clone(),
         ));
@@ -78,6 +77,7 @@ impl Executor {
             }
 
             let delay_queue_clone = delay_queue.clone();
+            let rpc_client_clone = client.clone();
             tokio::select! {
                 // Receive new orders to be added to the delay queue
                 _ = async {
@@ -103,8 +103,16 @@ impl Executor {
                             let order = expired.into_inner();
                             let executed_orders_tx_clone = executed_orders_tx_clone.clone();
                             let pending_orders_clone = pending_orders_clone.clone();
+                            let rpc_client_clone = rpc_client_clone.clone();
+                            let wallet = wallet.clone();
                             tokio::spawn(async move {
-                                match Self::execute_order(order, executed_orders_tx_clone, pending_orders_clone).await {
+                                match Self::execute_order(
+                                    rpc_client_clone,
+                                    order,
+                                    wallet,
+                                    executed_orders_tx_clone,
+                                    pending_orders_clone,
+                                ).await {
                                     Ok(_) => (),
                                     Err(e) => warn!("Failed to execute order: {}", e),
                                 }
@@ -112,15 +120,13 @@ impl Executor {
                         }
 
                         // Sleep to avoid busy loop
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 } => {}
             }
         });
 
         Self {
-            client,
-            wallet,
             pending_orders,
             delay_queue_tx,
             executed_orders_tx,
@@ -142,7 +148,7 @@ impl Executor {
 
         info!(
             "\n\
-            📊 Order {}!\n\
+            📊 Order {}\n\
             Pool: {}\n\
             Trade: {}\n\
             Side: {:?}\n\
@@ -160,46 +166,109 @@ impl Executor {
             order.created_at
         );
 
-        // If the order has a delay, send it to the delay queue
-        if order.delay > 0 {
-            match self.delay_queue_tx.send(order).await {
-                Ok(_) => (),
-                Err(e) => {
-                    info!("Failed to send order to delay queue: {}", e);
-                    return Err(Box::new(e));
-                }
+        // Either send the order to the delay queue or execute it immediately
+        // we will send the order to the delay queue for execution.
+        match self.delay_queue_tx.send(order).await {
+            Ok(_) => (),
+            Err(e) => {
+                info!("Failed to send order to delay queue: {}", e);
+                return Err(Box::new(e));
             }
-            return Ok(());
         }
-
-        // Otherwise, execute the order immediately in a separate task to not block the main loop
-        let executed_orders_tx = self.executed_orders_tx.clone();
-        let pending_orders = self.pending_orders.clone();
-        tokio::spawn(async move {
-            match Self::execute_order(order, executed_orders_tx, pending_orders).await {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("Failed to execute order: {}", e);
-                }
-            }
-        });
 
         Ok(())
     }
 
-    /// Executes the order and returns the updated order
+    /// Method to execute an order. It creates all the necessary transactions
+    /// with instructions and sends them to the blockchain for execution.
+    /// Tx will be sent via rpc client or BloxRoute API with bridge.
+    /// The method blocks until the receipt of the transaction is received.
+    /// Retries attempts are made in case of failure. If the order is executed
+    /// successfully, it will be sent to the executed_orders_tx channel.
     async fn execute_order(
+        rpc_client: Arc<RpcClient>,
         mut order: Order,
+        wallet: Arc<Wallet>,
         executed_orders_tx: Sender<Order>,
         pending_orders: Arc<DashMap<Pubkey, Vec<Order>>>,
     ) -> Result<Order, Box<dyn std::error::Error>> {
-        // Simulate tx confirmation and receipt time (~800ms)
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        let wallet_clone = wallet.clone();
+
+        // Choose submission method: via RPC or Bloxroute API
+        let mut tx = if order.executor == ExecutorType::Bloxroute {
+            // In case of bloxroute, the tx is generated via the Bloxroute API.
+            // The tx should be signed and submitted to the blockchain by RPC client.
+            match bloxroute::create_swap_tx(&vec![]).await {
+                Ok(tx) => tx,
+                Err(e) => {
+                    error!("Failed to create swap tx via Bloxroute: {}", e);
+                    return Err(e);
+                }
+            }
+        } else if order.executor == ExecutorType::RPC {
+            // Otherwise, build swap tx (Create ATA, SwapIn) manually.
+            let rpc_client_clone = rpc_client.clone();
+
+            // Based on the order direction, build the appropriate transaction:
+            match order.direction {
+                // Build swap in tx
+                OrderDirection::BaseIn => {
+                    match swap_tx::build_swap_in_tx(rpc_client_clone, &wallet_clone.keypair, &order).await {
+                        Ok(tx) => tx,
+                        Err(e) => {
+                            error!("Failed to build swap in transaction for order: {}", e);
+                            return Err(e);
+                        }
+                    }
+                }
+
+                // Build swap out tx
+                OrderDirection::BaseOut => {
+                    match swap_tx::build_swap_out_tx(rpc_client_clone, &wallet_clone.keypair, &order).await {
+                        Ok(tx) => tx,
+                        Err(e) => {
+                            error!("Failed to build swap out transaction for order: {}", e);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        } else {
+            return Err("Invalid executor type".into());
+        };
+
+        // Get the latest blockhash
+        let rpc_client_clone = rpc_client.clone();
+        let recent_blockhash = match rpc_client_clone.get_latest_blockhash().await {
+            Ok(hash) => hash,
+            Err(err) => {
+                return Err(Box::new(err));
+            }
+        };
+
+        // Sign the transaction with the wallet keypair
+        tx.sign(&[&wallet.keypair], recent_blockhash);
+
+        // Send tx to the blockchain, wait for confirmation receipt.
+        // let signature = match rpc_client.send_and_confirm_transaction(&tx).await {
+        //     Ok(signature) => signature,
+        //     Err(e) => {
+        //         error!("Failed to send and confirm transaction: {}", e);
+        //         return Err(Box::new(e));
+        //     }
+        // };
+
+        // Simulate tx confirmation and receipt time (~1600ms)
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        let signature = "simulated_signature";
 
         // Update order status
-        order.tx_id = Some("dummy_tx_id".to_string());
-        order.signature = Some("dummy_signature".to_string());
+        order.tx_id = Some(signature.to_string());
         order.status = OrderStatus::Completed;
+
+        // It's not accurate to use current_timestamp() here.
+        // We need to get slot and timestamp from the transaction receipt.
+        // For simplicity, we will use the current timestamp.
         order.confirmed_at = current_timestamp();
 
         info!(
@@ -214,7 +283,7 @@ impl Executor {
              ▶️ Confirmed At:    {}\n",
             order.trade_id,
             order.pool.to_string(),
-            order.signature.as_ref().unwrap(),
+            order.tx_id.as_ref().unwrap(),
             order.status,
             order.direction,
             order.amount_in,
@@ -237,7 +306,7 @@ impl Executor {
 
             // After modifying the entry, check if the entry is empty
             let pool_is_empty = orders_ref.is_empty();
-            drop(orders_ref); // Explicitly drop the mutable reference
+            drop(orders_ref); // Drop the mutable reference before removing the entry
 
             if pool_is_empty {
                 pending_orders.remove(&order.pool);

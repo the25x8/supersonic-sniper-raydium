@@ -5,14 +5,14 @@ use log::info;
 use solana_program::pubkey::Pubkey;
 use tokio_util::sync::CancellationToken;
 use crate::trader;
-use crate::trader::models::Trade;
+use crate::trader::trade::Trade;
 
 pub async fn print_active_trades() {
     let dummy_cancel_token = CancellationToken::new();
 
     // Load active trades
     let active_trades: Arc<DashMap<Pubkey, Vec<Trade>>> = Arc::new(DashMap::new());
-    let backup = trader::backup::Backup::new_for_trades(
+    let backup = trader::backup::Backup::new(
         active_trades.clone(),
         dummy_cancel_token,
     );

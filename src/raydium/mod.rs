@@ -1,4 +1,7 @@
 pub mod detector;
+mod instructions;
+
+pub use instructions::{build_swap_in_instruction, build_swap_out_instruction};
 
 use std::str::FromStr;
 use borsh_derive::BorshDeserialize;

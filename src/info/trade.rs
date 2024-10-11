@@ -4,10 +4,11 @@ use dashmap::DashMap;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use log::info;
-use chrono::{NaiveDateTime};
+use chrono::NaiveDateTime;
 use solana_sdk::pubkey::Pubkey;
 use tokio_util::sync::CancellationToken;
-use crate::trader::models::{Trade, Order, OrderStatus, OrderKind, TradeStatus};
+use crate::executor::order::{Order, OrderKind, OrderStatus};
+use crate::trader::trade::{Trade, TradeStatus};
 use crate::trader::backup::Backup;
 
 pub async fn print_trade_info(query: &str) {
@@ -15,7 +16,7 @@ pub async fn print_trade_info(query: &str) {
     let dummy_cancel_token = CancellationToken::new();
     let trades_history: Arc<Mutex<Vec<Trade>>> = Arc::new(Mutex::new(Vec::new()));
     let active_trades: Arc<DashMap<Pubkey, Vec<Trade>>> = Arc::new(DashMap::new());
-    let backup = Backup::new_for_trades(active_trades.clone(), dummy_cancel_token);
+    let backup = Backup::new(active_trades.clone(), dummy_cancel_token);
     backup.load_trades_history(trades_history.clone()).await;
     backup.load_active_trades().await;
 

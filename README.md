@@ -26,6 +26,12 @@ cd supersonic-sniper-bot
 cargo build --release
 ```
 
+#### Required files and directories
+- `config/`: Contains configuration files for the bot.
+- `data/active_trades.json`: List of trades currently active.
+- `data/trade_history.json`: History of completed trades.
+- `data/pending_orders.json`: Current open orders.
+
 ## Configuration
 
 The bot can be configured via a `.yml` file or environment variables. If using environment variables, they should be prefixed with `SSS_`. For example:
@@ -38,11 +44,6 @@ SSS_WALLET_SECRET_KEY=your_private_key_here
 Start the bot with default settings:
 ```bash
 cargo run -- --config config/default.yml
-```
-
-To monitor a specific trading pair:
-```bash
-cargo run -- --pair <pair_address>
 ```
 
 This `README.md` provides a high-level overview of the bot and how to get started. As we add features, we'll keep updating this documentation.

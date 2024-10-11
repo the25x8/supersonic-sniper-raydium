@@ -357,13 +357,12 @@ impl MarketMonitor {
                 RECONNECT_BACKOFF,
             ).await {
                 error!("Max reconnection retries for Raydium pool stream exceeded");
-                cancel_token.cancel(); // Gracefully exit the bot
                 break;
             }
         }
 
         // Cancel the token
-        error!("Market Monitor task has been terminated, the bot is stopping...");
+        info!("Market monitor has been terminated");
         cancel_token.cancel();
     }
 
