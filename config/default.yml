@@ -9,6 +9,12 @@ bloxroute:
   # If enabled, the bot will use Bloxroute to broadcast
   # transactions to speed up the transaction propagation.
   enabled: false
+  
+  # Configure how the bot will create the swap transactions.
+  # By default, the unsigned tx will be created by the bot,
+  # but if you enable this option Bloxroute will create the
+  # unsigned tx for signing.
+  create_swap_tx: true
 
   # Bloxroute URL and WebSocket URL.
   url: "https://uk.solana.dex.blxrbdn.com"
@@ -46,6 +52,9 @@ detector:
 
 # Trader module configuration
 trader:
+  # If enabled, the bot will close all open trades on shutdown by current price.
+  close_trades_on_shutdown: true
+  
   # List of conditions that can be used to choose the strategy.
   # Any condition with a value of 0 or commented out will be ignored.
   strategies:

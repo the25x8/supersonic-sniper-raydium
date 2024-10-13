@@ -1,6 +1,6 @@
 [package]
 name = "supersonic-sniper"
-version = "0.0.1"
+version = "0.2.0"
 edition = "2021"
 authors = ["25x8 <25x8@tuta.io>"]
 description = "A high-speed trading bot for Raydium on Solana"
@@ -55,6 +55,7 @@ uuid = { version = "1.10.0", features = ["v4", "serde"] }
 console-subscriber = "0.4.0"
 dashmap = { version = "6.1.0", features = ["serde", "inline"] }
 reqwest = { version = "0.12.8", features = ["json"] }
+bincode = "1.3.3"
 
 [patch.crates-io.aes-gcm-siv]
 git = "https://github.com/RustCrypto/AEADs"

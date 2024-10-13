@@ -45,11 +45,11 @@ fn format_trade_row(trade: &Trade) -> String {
 
     format!(
         "{:<46} | {:<10} | {:<12.9} | {:<12.9} | {:<12.9} | {:<12.2} | {:<14.9} | {:<19}",
-        trade.pool.pool_address,
-        format!("{:?}", trade.status),
+        trade.pool_keys.id.to_string(),
+        trade.get_completed_sell_order().unwrap().kind,
         trade.quote_in_amount,
-        trade.buy_price.to_string(),
-        trade.sell_price.to_string(),
+        trade.buy_price,
+        trade.sell_price,
         trade.profit_percent,
         trade.profit_amount,
         created_at,

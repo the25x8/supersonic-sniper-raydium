@@ -93,7 +93,7 @@ fn format_active_trade_row(trade: &Trade) -> String {
 
     format!(
         "{:<44} | {:<12} | {:<15} | {:<12} | {:<12} | {:<14} | {:<19}",
-        trade.pool.pool_address,
+        trade.pool_keys.id.to_string(),
         amount,
         tokens,
         buy_price,

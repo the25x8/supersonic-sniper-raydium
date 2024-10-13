@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use log::info;
-use chrono::NaiveDateTime;
+use chrono::{NaiveDateTime, TimeZone};
 use solana_sdk::pubkey::Pubkey;
 use tokio_util::sync::CancellationToken;
 use crate::executor::order::{Order, OrderKind, OrderStatus};
@@ -41,7 +41,7 @@ pub async fn print_trade_info(query: &str) {
     } else if let Ok(pubkey) = Pubkey::from_str(query) {
         // Search for trades where pool id or base mint matches
         for trade in all_trades.iter() {
-            if trade.pool.pubkey == pubkey || trade.pool.base_mint == pubkey {
+            if trade.pool_keys.id == pubkey || trade.pool_keys.base_mint == pubkey {
                 matching_trades.push(trade.clone());
             }
         }
@@ -80,9 +80,9 @@ pub async fn print_trade_info(query: &str) {
             "=".repeat(80),
             trade.id,
             trade.status,
-            trade.pool.pool_address,
-            trade.pool.base_mint,
-            trade.pool.quote_mint,
+            trade.pool_keys.id,
+            trade.pool_keys.base_mint,
+            trade.pool_keys.quote_mint,
             trade.strategy_name,
             trade.wallet,
             format_timestamp(trade.created_at),
@@ -140,13 +140,14 @@ pub async fn print_trade_info(query: &str) {
 }
 
 // Helper functions
-fn format_timestamp(timestamp_ms: u64) -> String {
-    if timestamp_ms == 0 {
+fn format_timestamp(timestamp: u64) -> String {
+    if timestamp == 0 {
         "N/A".to_string()
     } else {
-        NaiveDateTime::from_timestamp((timestamp_ms / 1000) as i64, 0)
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string()
+        chrono::Utc.timestamp_opt(timestamp as i64, 0)
+            .single()
+            .unwrap()
+            .to_rfc3339()
     }
 }
 
@@ -170,8 +171,8 @@ fn format_order_row(order: &Order) -> String {
         order.id,
         order.direction,
         order.kind,
-        order.amount_in,
-        order.min_amount_out,
+        order.amount,
+        order.limit_amount,
         order.status,
         created_at,
         executed_at,

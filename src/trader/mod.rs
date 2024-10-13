@@ -1,59 +1,46 @@
-mod market_monitor;
 pub mod backup;
 pub mod trade;
 
 use std::collections::HashMap;
 use solana_sdk::pubkey::Pubkey;
-use std::str::FromStr;
 use std::sync::Arc;
 use chrono::TimeZone;
 use dashmap::DashMap;
 use log::{debug, error, info, warn};
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_program::program_option::COption;
-use solana_program::program_pack::Pack;
-use mpl_token_metadata::accounts::Metadata;
-use solana_account_decoder::parse_token::UiTokenAmount;
-use spl_token::state::Mint;
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
-use crate::config::{ExecutorType, StrategyConfig, TraderConfig};
-use crate::detector::{Pool, PoolType};
-use crate::solana::amount_utils::token_amount_to_float;
-use crate::solana::quote_mint::{USDC_MINT, WSOL_MINT};
+use crate::config::{AppConfig, BloxrouteConfig, ExecutorType, StrategyConfig};
+use crate::detector::{Pool};
+use crate::solana::quote_mint::USDC_MINT;
 use crate::executor::Executor;
 use crate::executor::order::{Order, OrderDirection, OrderKind, OrderStatus};
-use crate::trader::market_monitor::{convert_reserves_to_price, get_amm_pool_reserves, MarketData, MarketMonitor};
+use crate::raydium::{convert_reserves_to_price, get_amm_pool_reserves};
+use crate::market::monitor::{MarketData, MarketMonitor};
 use crate::trader::backup::Backup;
 use crate::trader::trade::{Trade, TradeExchange};
 use crate::wallet::Wallet;
-
 
 /// The Trader module is responsible for executing token swaps on Raydium with minimal delay.
 /// It handles events from the Detector module efficiently and performs post-swap actions
 /// such as transferring purchased tokens to specified wallets and implementing advanced
 /// selling strategies.
 
-// Metaplex Token Metadata Program ID
-const METADATA_PROGRAM_ID: &str = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s";
-
 pub struct ChooseStrategyParams {
     pub pool: Pool,
     pub freezable: bool,
     pub mint_renounced: bool,
     pub meta_mutable: bool,
-    pub base_metadata: Option<Metadata>,
-    pub base_mint: Mint,
-    pub base_reserves: UiTokenAmount,
-    pub quote_reserves: UiTokenAmount,
+    pub base_supply: u64,
+    pub base_reserves: f64,
+    pub quote_reserves: f64,
     pub price: f64,
 }
 
 pub struct Trader {
     client: Arc<RpcClient>,
     wallet: Arc<Wallet>,
-    config: Arc<TraderConfig>,
+    config: Arc<AppConfig>,
     backup: Arc<Backup>,
     pool_rx: Receiver<Pool>,
 
@@ -67,7 +54,7 @@ pub struct Trader {
 impl Trader {
     /// Creates a new instance of the Trader module.
     pub async fn new(
-        config: Arc<TraderConfig>,
+        config: Arc<AppConfig>,
         client: Arc<RpcClient>,
         wallet: Arc<Wallet>,
         pool_rx: Receiver<Pool>,
@@ -106,6 +93,7 @@ impl Trader {
             active_trades.clone(),
             market_monitor.clone(),
             backup.clone(),
+            &config.bloxroute,
             cancel_token.clone(),
         ).await;
 
@@ -133,20 +121,20 @@ impl Trader {
     /// Activates the trader module by starting to listen for new detected pools.
     pub async fn start(&mut self) {
         // Create a semaphore with a limit
-        let semaphore = Arc::new(Semaphore::new(10));
+        // let semaphore = Arc::new(Semaphore::new(10));
         let cancel_token = self.cancel_token.clone();
-        tokio::select! {
-            // Subscribe to new detected pools and initiate the trading process
-            _ = async {
-                while let Some(pool) = self.pool_rx.recv().await {
-                    self.process_detected_pool(pool, self.executor.clone(), semaphore.clone()).await;
+        loop {
+            tokio::select! {
+                // Subscribe to new detected pools and initiate the trading process
+                Some(pool) = self.pool_rx.recv() => {
+                    self.process_detected_pool(pool, self.executor.clone()).await;
                 }
-            } => {}
 
-            // Stop the trader if the cancel token is triggered
-            _ = cancel_token.cancelled() => {
-                info!("Trader module has been terminated");
-                return;
+                // Stop the trader if the cancel token is triggered
+                _ = cancel_token.cancelled() => {
+                    info!("Trader module has been terminated");
+                    return;
+                }
             }
         }
     }
@@ -160,6 +148,7 @@ impl Trader {
         active_trades: Arc<DashMap<Pubkey, Vec<Trade>>>,
         market_monitor: Arc<MarketMonitor>,
         backup: Arc<Backup>,
+        bloxroute_config: &BloxrouteConfig,
         cancel_token: CancellationToken,
     ) -> Arc<Executor> {
         // Initialize the executor module and get the arc reference
@@ -168,6 +157,7 @@ impl Trader {
             client.clone(),
             wallet.clone(),
             executed_orders_tx,
+            bloxroute_config,
             cancel_token,
         ).await);
 
@@ -205,15 +195,12 @@ impl Trader {
         active_trades: Arc<DashMap<Pubkey, Vec<Trade>>>,
         mut market_data_rx: Receiver<MarketData>,
     ) {
-        // Collect the pools (keys) to be added to the watchlist
-        let pools: Vec<Pubkey> = {
-            active_trades.clone().iter().map(|t| t.key().clone()).collect()
-        };
-
-        // Add each pool to the market monitor watchlist
-        for pool in pools {
-            market_monitor.add_to_watchlist(pool).await;
-        }
+        // Collect the initial pools to be added to the watchlist
+        let active_trades_clone = active_trades.clone();
+        active_trades_clone.clone().iter().for_each(|t| {
+            let pool_keys = t.value()[0].pool_keys.clone();
+            let _ = market_monitor.add_to_watchlist(t.key(), &pool_keys);
+        });
 
         // Subscribe to market data updates and process them
         let active_trades = active_trades.clone();
@@ -359,9 +346,6 @@ impl Trader {
                                         );
                                     }
                                 }
-
-                                // Skip the trade if the stop loss order was executed
-                                continue;
                             }
                         }
                     }
@@ -384,7 +368,7 @@ impl Trader {
         backup: Arc<Backup>,
     ) {
         let trade_id = order.trade_id;
-        let pool_pubkey = order.pool;
+        let pool_pubkey = order.pool_keys.id;
         let trade_option = {
             // Scope for the mutable reference
             if let Some(trades_ref) = trades.get(&pool_pubkey) {
@@ -415,8 +399,8 @@ impl Trader {
         // 1. Get current price
         let current_price = match get_amm_pool_reserves(
             rpc_client.clone(),
-            &trade.pool.base_vault,
-            &trade.pool.quote_vault,
+            &trade.pool_keys.base_vault,
+            &trade.pool_keys.quote_vault,
         ).await {
             Ok(reserves) => match convert_reserves_to_price(&reserves[0], &reserves[1]) {
                 Ok(price) => price,
@@ -435,8 +419,8 @@ impl Trader {
         // TODO - This is a simple estimation, we need to improve this by
         //  fetching the actual amount from spl-token accounts of the wallet.
         let estimated_amount_out = match order.direction {
-            OrderDirection::BaseIn => order.amount_in / current_price,
-            OrderDirection::BaseOut => order.amount_in * current_price,
+            OrderDirection::BaseIn => order.amount / current_price,
+            OrderDirection::BaseOut => order.amount * current_price,
         };
 
         // 3. Handle the order based on the direction
@@ -453,7 +437,7 @@ impl Trader {
                 if let Some(mut trades_ref) = trades.get_mut(&pool_pubkey) {
                     if let Some(trade_in_map) = trades_ref.value_mut().iter_mut().find(|t| t.id == trade.id) {
                         trade_in_map.buy(
-                            order.amount_in,
+                            order.amount,
                             estimated_amount_out,
                             order.tx_id.unwrap(),
                             current_timestamp(),
@@ -463,9 +447,17 @@ impl Trader {
                 }
 
                 // Register the new orders for the trade (before executing)
-                let mut hold_time_order: Option<Order> = None;
                 if let Some(mut trades_ref) = trades.get_mut(&pool_pubkey) {
                     if let Some(trade_in_map) = trades_ref.value_mut().iter_mut().find(|t| t.id == trade.id) {
+                        // Define stop-loss executor for the order
+                        let stop_loss_executor = {
+                            if trade.strategy.stop_loss_executor.is_some() {
+                                trade.strategy.stop_loss_executor.unwrap()
+                            } else {
+                                ExecutorType::RPC
+                            }
+                        };
+
                         // Determine the possible sell orders based on the strategy.
                         let possible_sell_orders = vec![
                             (
@@ -474,12 +466,15 @@ impl Trader {
                                     OrderDirection::BaseOut,
                                     trade.id,
                                     OrderKind::HoldTime,
-                                    &pool_pubkey,
-                                    &trade.pool.base_mint,
-                                    &trade.pool.quote_mint,
+                                    &trade.pool_keys,
                                     estimated_amount_out,
                                     estimated_amount_out - (estimated_amount_out * (trade.strategy.sell_slippage / 100.0)),
-                                    ExecutorType::RPC,
+                                    &trade.pool_keys.base_mint,
+                                    &trade.pool_keys.quote_mint,
+                                    trade.base_decimals,
+                                    trade.quote_decimals,
+                                    ExecutorType::RPC, // Hold time order is always executed by RPC
+                                    trade.strategy.buy_bribe,
                                     trade.strategy.hold_time,
                                 ),
                             ),
@@ -489,12 +484,15 @@ impl Trader {
                                     OrderDirection::BaseOut,
                                     trade.id,
                                     OrderKind::TakeProfit,
-                                    &pool_pubkey,
-                                    &trade.pool.base_mint,
-                                    &trade.pool.quote_mint,
+                                    &trade.pool_keys,
                                     estimated_amount_out,
                                     estimated_amount_out - (estimated_amount_out * (trade.strategy.sell_slippage / 100.0)),
-                                    ExecutorType::RPC,
+                                    &trade.pool_keys.base_mint,
+                                    &trade.pool_keys.quote_mint,
+                                    trade.base_decimals,
+                                    trade.quote_decimals,
+                                    trade.strategy.take_profit_executor,
+                                    trade.strategy.sell_bribe,
                                     trade.strategy.sell_delay,
                                 ),
                             ),
@@ -504,12 +502,15 @@ impl Trader {
                                     OrderDirection::BaseOut,
                                     trade.id,
                                     OrderKind::StopLoss,
-                                    &pool_pubkey,
-                                    &trade.pool.base_mint,
-                                    &trade.pool.quote_mint,
+                                    &trade.pool_keys,
                                     estimated_amount_out,
                                     estimated_amount_out - (estimated_amount_out * (trade.strategy.sell_slippage / 100.0)),
-                                    ExecutorType::RPC,
+                                    &trade.pool_keys.base_mint,
+                                    &trade.pool_keys.quote_mint,
+                                    trade.base_decimals,
+                                    trade.quote_decimals,
+                                    stop_loss_executor,
+                                    trade.strategy.sell_bribe,
                                     trade.strategy.sell_delay,
                                 ),
                             )
@@ -529,23 +530,23 @@ impl Trader {
                         }
 
                         // Copy hold time order for execution
-                        hold_time_order = trade.hold_time_order;
-                    }
-                    // trades_ref mutable reference is dropped here
-                }
+                        let hold_order = trade_in_map.clone().hold_time_order;
+                        drop(trades_ref); // Explicitly drop the mutable reference here
 
-                // If hold time is set, execute the hold order immediately
-                if trade.strategy.hold_time > 0 && !hold_time_order.is_none() {
-                    // Hold order is the first order in the list
-                    if let Err(e) = executor.order(hold_time_order.unwrap()).await {
-                        error!("Failed to schedule sell order: {}", e);
-                        return;
+                        // If hold time is set, execute the hold order immediately
+                        if hold_order.is_some() {
+                            // Hold order is the first order in the list
+                            if let Err(e) = executor.order(hold_order.unwrap()).await {
+                                error!("Failed to schedule sell order: {}", e);
+                                return;
+                            }
+                        }
                     }
                 }
 
                 // If you take profit or stop loss is set, add the pool to the watchlist
                 if trade.strategy.take_profit > 0.0 || trade.strategy.stop_loss > 0.0 {
-                    market_monitor.add_to_watchlist(pool_pubkey).await;
+                    market_monitor.add_to_watchlist(&pool_pubkey, &trade.pool_keys).await;
                 }
             }
 
@@ -566,7 +567,7 @@ impl Trader {
                         // Confirm the sell order
                         if let Err(e) = trade_in_map.sell(
                             order.kind,
-                            order.amount_in,
+                            order.amount,
                             estimated_amount_out,
                             order.tx_id.unwrap(),
                             current_timestamp(),
@@ -603,7 +604,7 @@ impl Trader {
                                 🚀 Completed in:    {} sec.\n",
                                 trade_in_map.id,
                                 completed_sell_order.kind,
-                                trade_in_map.pool.pool_address,
+                                trade_in_map.pool_keys.id.to_string(),
                                 trade_in_map.buy_price,
                                 trade_in_map.sell_price,
                                 trade_in_map.profit_amount,
@@ -631,7 +632,7 @@ impl Trader {
 
                 // Async operations after dropping the lock
                 if is_completed && trade_copy.is_some() {
-                    market_monitor.remove_from_watchlist(pool_pubkey).await;
+                    market_monitor.remove_from_watchlist(&pool_pubkey).await;
                     backup.save_trade_in_history(trade_copy.unwrap()).await;
                 }
             }
@@ -640,104 +641,33 @@ impl Trader {
 
     /// Determines the best strategy to use based on the pool data and the trader configuration.
     /// Creates a new active trade and schedules the buy order if a strategy is chosen.
-    async fn process_detected_pool(&self, pool: Pool, executor: Arc<Executor>, semaphore: Arc<Semaphore>) {
+    async fn process_detected_pool(&self, pool: Pool, executor: Arc<Executor>) {
         let start_time = chrono::Utc::now().time();
-        let pool = pool.clone(); // Clone the pool to use in tasks
         let wallet = self.wallet.clone(); // Clone the wallet to use in tasks
         let config = self.config.clone(); // Clone the config to use in tasks
         let executor = executor.clone(); // Clone the executor to use in tasks
         let active_trades = self.active_trades.clone(); // Clone the active trades hashmap
-        let semaphore = semaphore.clone();
-        let client = self.client.clone();
 
         // Check if the pool is already being traded. It can happen when
         // the active trade for this pool was recovered from the backup file.
-        if active_trades.contains_key(&pool.pubkey) {
-            return;
-        }
+        // if active_trades.contains_key(&pool.keys.id) {
+        //     return;
+        // }
 
         // Process the detected pool
         tokio::spawn(async move {
-            let _permit = semaphore.acquire().await; // Acquire permit before processing
-
-            debug!(
-                "\nProcessing new pool: {}\n\
-                Open time: {}\n",
-                pool.pool_address,
-                pool.open_time.to_rfc3339(),
-            );
-
-            // Fetch all the required data concurrently
-            let (
-                pool_reserves_result,
-                token_metadata_result,
-                token_mint_result
-            ) = tokio::join!(
-                get_amm_pool_reserves(client.clone(), &pool.base_vault, &pool.quote_vault),
-                Trader::get_token_metadata(client.clone(), &pool.base_mint),
-                Trader::get_token_mint(client.clone(), &pool.base_mint)
-            );
-
-            // Get liquidity of the pool
-            let (base_reserves, quote_reserves) = match pool_reserves_result {
-                Ok(balances) => (balances[0].clone(), balances[1].clone()),
-                Err(e) => {
-                    error!("Failed to get pool liquidity: {}", e);
-                    return;
-                }
-            };
-
-            // Get the account data for the token vault mint
-            let base_mint = match token_mint_result {
-                Ok(mint) => mint,
-                Err(e) => {
-                    error!("Failed to get token mint account: {}", e);
-                    return;
-                }
-            };
-
-            // Get the token metadata
-            let token_metadata = match token_metadata_result {
-                Ok(metadata) => metadata,
-                Err(e) => {
-                    error!("Failed to get token metadata: {}", e);
-                    return;
-                }
-            };
-
-            // Calculate the price of token1 in terms of token2
-            let price = match market_monitor::convert_reserves_to_price(&base_reserves, &quote_reserves) {
-                Ok(price) => price,
-                Err(e) => {
-                    error!("Failed to calculate token price: {}", e);
-                    return;
-                }
-            };
-
-            let freezable = base_mint.freeze_authority != COption::None;
-            let mint_renounced = base_mint.mint_authority == COption::None;
-
-            // Clone the metadata for printing
-            let cloned_metadata = token_metadata.clone();
-            let meta_mutable = if !cloned_metadata.is_none() {
-                cloned_metadata.unwrap().is_mutable.clone()
-            } else {
-                false
-            };
-
             // Choose the best strategy based on the pool data and the trader configuration
             let (strategy_name, strategy) = match Self::choose_strategy(
-                config.strategies.clone(),
+                &config.trader.strategies,
                 ChooseStrategyParams {
-                    freezable,
-                    mint_renounced,
-                    meta_mutable,
                     pool: pool.clone(),
-                    base_mint: base_mint.clone(),
-                    base_metadata: token_metadata.clone(),
-                    base_reserves: base_reserves.clone(),
-                    quote_reserves: quote_reserves.clone(),
-                    price: price.clone(),
+                    base_reserves: pool.base_reserves,
+                    quote_reserves: pool.quote_reserves,
+                    freezable: pool.base_freezable,
+                    mint_renounced: pool.base_mint_renounced,
+                    meta_mutable: pool.base_meta_mutable,
+                    base_supply: pool.base_supply,
+                    price: pool.initial_price,
                 },
             ) {
                 Ok((strategy, config)) => (strategy, config),
@@ -748,60 +678,24 @@ impl Trader {
                 }
             };
 
-            // Print all the information
-            debug!(
-                "\n🔵 New {} Pool Processed Successfully!\n\
-                 ─────────────────────────────────────────────────────\n\
-                 ▶️ Pair:               {}\n\
-                 ▶️ Mint:               {}\n\
-                 ▶️ Opened:             {}\n\
-                 ▶️ Pooled Tokens:      {}\n\
-                 ▶️ Pooled Base:        {}\n\
-                 ▶️ Token Price:        {:.10}\n\
-                 ▶️ Symbol:             {}\n\
-                 ▶️ Supply:             {}\n\
-                 ▶️ Decimals:           {}\n\
-                 ▶️ Owner:              {}\n\
-                 ▶️ Can Owner Mint?:    {}\n\
-                 ▶️ Can Owner Freeze?:  {}\n\
-                 ▶️ Metadata Mutable?:  {}\n\
-                 ▶️ Strategy:           {:?}\n\
-                 ⚡️ Processed in:       {} ms\n",
-                match pool.pool_type {
-                    PoolType::RaydiumAmm => "Raydium AMM",
-                    PoolType::RaydiumClmm => "Raydium CLMM",
-                },
-                pool.pool_address,
-                pool.base_mint,
-                pool.open_time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                base_reserves.ui_amount_string,
-                quote_reserves.ui_amount_string,
-                price,
-                token_metadata.map(|m| m.symbol).unwrap_or("N/A".to_string()),
-                base_mint.supply,
-                base_mint.decimals,
-                base_mint.mint_authority.unwrap_or_default().to_string(),
-                if mint_renounced { "No" } else { "Yes" },
-                if freezable { "Yes" } else { "No" },
-                if meta_mutable { "Yes" } else { "No" },
-                strategy_name,
-                (chrono::Utc::now().time() - start_time).num_milliseconds()
-            );
-
-            let start_time = chrono::Utc::now().time();
-
             // Create a new trade instance and its orders
-            let pool_clone = pool.clone();
             let trade = Trade::new(
                 TradeExchange::Raydium,
-                pool_clone,
-                wallet.pubkey,
+                &pool.keys,
+                &wallet.pubkey,
                 strategy_name,
                 strategy,
+                pool.base_decimals,
+                pool.quote_decimals,
             );
 
             // Execute the buy order for the trade and schedule the sell orders based on the strategy
-            let trade = match Self::create_buy_order(trade, executor.clone(), price).await {
+            let trade = match Self::create_buy_order(
+                trade,
+                executor.clone(),
+                pool.initial_price,
+                config.bloxroute.enabled,
+            ).await {
                 Ok(trade) => trade,
                 Err(_) => {
                     warn!("Failed to create trade orders for the pool");
@@ -810,11 +704,11 @@ impl Trader {
             };
 
             // Add the new trade to the active trades hashmap
-            if let Some(mut existing_trades) = active_trades.get_mut(&pool.pubkey) {
+            if let Some(mut existing_trades) = active_trades.get_mut(&pool.keys.id) {
                 existing_trades.push(trade.clone());
             } else {
                 // Create a new vector and insert the trade
-                active_trades.insert(pool.pubkey, vec![trade.clone()]);
+                active_trades.insert(pool.keys.id, vec![trade.clone()]);
             }
 
             debug!(
@@ -828,7 +722,7 @@ impl Trader {
                  ▶️ Stop Loss:       {:.10}%\n\
                  ▶️ Hold Time:       {} ms\n\
                  ⚡️ Processed in:    {} ms\n",
-                trade.pool.pubkey.to_string(),
+                pool.keys.id.to_string(),
                 trade.strategy_name,
                 trade.strategy.quote_amount,
                 trade.strategy.buy_slippage,
@@ -847,6 +741,7 @@ impl Trader {
         mut trade: Trade,
         executor: Arc<Executor>,
         current_price: f64,
+        bloxroute_enabled: bool,
     ) -> Result<Trade, ()> {
         // Confirm that at least one sell condition is set
         if trade.strategy.take_profit == 0.0 &&
@@ -855,6 +750,21 @@ impl Trader {
             warn!("Cannot create a buy order without a sell condition");
             return Err(());
         }
+
+        // Define should we use BloxRoute for the buy order
+        let use_bloxroute = {
+            // Disable if it is not enabled in the config
+            if !bloxroute_enabled {
+                false;
+            }
+
+            // Set to true if the buy executor is BloxRoute
+            if trade.strategy.buy_executor == ExecutorType::Bloxroute {
+                true;
+            }
+
+            false
+        };
 
         // Prepare the buy order
         let amount_in = trade.strategy.quote_amount;
@@ -865,12 +775,20 @@ impl Trader {
             OrderDirection::BaseIn,
             trade.id,
             OrderKind::SimpleBuy,
-            &trade.pool.pubkey,
-            &trade.pool.quote_mint, // spend quote token
-            &trade.pool.base_mint, // buy base token
+            &trade.pool_keys,
             amount_in,
             min_amount_out,
-            ExecutorType::Bloxroute,
+            &trade.pool_keys.quote_mint,
+            &trade.pool_keys.base_mint,
+            trade.quote_decimals,
+            trade.base_decimals,
+            // Determine the executor type for the buy order
+            if use_bloxroute {
+                ExecutorType::Bloxroute
+            } else {
+                ExecutorType::RPC
+            },
+            trade.strategy.buy_bribe,
             trade.strategy.buy_delay,
         );
 
@@ -880,7 +798,7 @@ impl Trader {
             Err(e) => {
                 error!(
                     "Failed to register buy order for the pool: {}.\n Error: {}",
-                    trade.pool.pubkey.to_string(), e
+                    trade.pool_keys.id.to_string(), e
                 );
                 return Err(());
             }
@@ -892,7 +810,7 @@ impl Trader {
             Err(e) => {
                 error!(
                     "Failed to execute buy order for the pool: {}.\n Error: {}",
-                    trade.pool.pubkey.to_string(), e
+                    trade.pool_keys.id.to_string(), e
                 );
                 return Err(());
             }
@@ -903,7 +821,7 @@ impl Trader {
 
     /// Chooses the best strategy based on the pool data and the trader configuration.
     /// The function returns the configuration of the chosen strategy.
-    fn choose_strategy(strategies: HashMap<String, StrategyConfig>, params: ChooseStrategyParams) -> Result<(String, StrategyConfig), ()> {
+    fn choose_strategy(strategies: &HashMap<String, StrategyConfig>, params: ChooseStrategyParams) -> Result<(String, StrategyConfig), ()> {
         // Check that strategies are defined in the config
         if strategies.is_empty() {
             error!("No strategies defined in the configuration");
@@ -932,10 +850,9 @@ impl Trader {
 
             // Check quote symbol conditions
             if let Some(quote_symbol) = strategy.quote_symbol.clone() {
-                let quote_mint = params.pool.quote_mint.to_string();
                 // Check is the quote mint is wrapped SOL or USDC
-                if (quote_symbol == "WSOL" && quote_mint != WSOL_MINT) ||
-                    (quote_symbol == "USDC" && quote_mint != USDC_MINT) {
+                if (quote_symbol == "WSOL" && params.pool.keys.quote_mint != spl_token::native_mint::id()) ||
+                    (quote_symbol == "USDC" && params.pool.keys.quote_mint.to_string() != USDC_MINT) {
                     debug!("Quote symbol condition not met");
                     continue;
                 }
@@ -968,13 +885,9 @@ impl Trader {
             }
 
             // Check reserves conditions
-            let scaled_quote_reserves = token_amount_to_float(
-                &params.quote_reserves.amount,
-                params.pool.quote_decimals.unwrap_or(9),
-            );
             if Trader::is_condition_met(
                 strategy.reserves_quote_condition.clone(),
-                scaled_quote_reserves,
+                params.quote_reserves,
                 Some(strategy.reserves_quote.unwrap_or(0.0)),
                 strategy.reserves_quote_range.clone(),
             ) {
@@ -982,13 +895,9 @@ impl Trader {
                 continue;
             }
 
-            let scaled_base_reserves = token_amount_to_float(
-                &params.base_reserves.amount,
-                params.pool.base_decimals.unwrap_or(9),
-            );
             if Trader::is_condition_met(
                 strategy.reserves_base_condition.clone(),
-                scaled_base_reserves,
+                params.base_reserves,
                 Some(strategy.reserves_base.unwrap_or(0.0)),
                 strategy.reserves_base_range.clone(),
             ) {
@@ -999,7 +908,7 @@ impl Trader {
             // Check total supply conditions
             if Trader::is_condition_met(
                 strategy.total_supply_condition.clone(),
-                params.base_mint.supply as f64,
+                params.base_supply as f64,
                 Some(strategy.total_supply.unwrap_or(0.0)),
                 strategy.total_supply_range.clone(),
             ) {
@@ -1051,60 +960,6 @@ impl Trader {
 
         // If no target value is provided, skip the condition check and return true
         true
-    }
-
-    async fn get_token_mint(client: Arc<RpcClient>, token_mint: &Pubkey) -> Result<Mint, Box<dyn std::error::Error + Send + Sync>> {
-        // Get the account data for the token vault mint
-        let token_mint_account = match client.get_account(token_mint).await {
-            Ok(account) => account,
-            Err(e) => {
-                error!("Failed to get token mint account: {}", e);
-                return Err(Box::new(e));
-            }
-        };
-
-        // Unpack the mint data
-        let mint = match Mint::unpack_from_slice(&token_mint_account.data) {
-            Ok(mint) => mint,
-            Err(e) => {
-                error!("Failed to unpack mint data: {}", e);
-                return Err(Box::new(e));
-            }
-        };
-        Ok(mint)
-    }
-
-    async fn get_token_metadata(client: Arc<RpcClient>, mint_address: &Pubkey) -> Result<Option<Metadata>, Box<dyn std::error::Error + Send + Sync>> {
-        // Derive the PDA (Program Derived Address) for the token metadata
-        let mpl_program_id = Pubkey::from_str(METADATA_PROGRAM_ID).unwrap();
-        let (metadata_pda, _bump_seed) = Pubkey::find_program_address(
-            &[
-                b"metadata",
-                &mpl_program_id.to_bytes(),
-                mint_address.as_ref(),
-            ],
-            &mpl_program_id,
-        );
-
-        // Fetch the metadata account
-        let account_data = match client.get_account_data(&metadata_pda).await {
-            Ok(data) => data,
-            Err(e) => {
-                error!("Failed to get metadata account data: {}", e);
-                return Ok(None);
-            }
-        };
-
-        // Deserialize the data into the Metadata struct
-        let metadata = match Metadata::from_bytes(&account_data) {
-            Ok(metadata) => metadata,
-            Err(e) => {
-                error!("Failed to deserialize metadata account data: {}", e);
-                return Ok(None);
-            }
-        };
-
-        Ok(Some(metadata))
     }
 }
 

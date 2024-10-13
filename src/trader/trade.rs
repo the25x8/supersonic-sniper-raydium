@@ -5,7 +5,7 @@ use solana_program::pubkey::Pubkey;
 use uuid::Uuid;
 
 use crate::config::StrategyConfig;
-use crate::detector::Pool;
+use crate::detector::PoolKeys;
 use crate::executor::order::{Order, OrderKind, OrderStatus};
 use crate::trader::current_timestamp;
 
@@ -20,12 +20,16 @@ use crate::trader::current_timestamp;
 pub struct Trade {
     pub id: Uuid,
 
-    pub pool: Pool, // Detected pool for the trade with its metadata
+    // Pool keys contain the all the keys required to execute the trade
+    pub pool_keys: PoolKeys,
     pub exchange: TradeExchange,
     pub strategy_name: String, // The name of the strategy used for the trade
     pub strategy: StrategyConfig, // The strategy used for the trade
     pub status: TradeStatus, // The status of the trade
     pub wallet: Pubkey, // SOL wallet address used to send txs and receive tokens
+
+    pub base_decimals: u8,
+    pub quote_decimals: u8,
 
     // Amounts in and out for the trade in terms of quote tokens
     pub quote_in_amount: f64,
@@ -55,21 +59,25 @@ impl Trade {
     /// Creates a new instance of the Trade struct.
     pub fn new(
         exchange: TradeExchange,
-        pool: Pool,
-        wallet: Pubkey,
+        pool_keys: &PoolKeys,
+        wallet: &Pubkey,
         strategy_name: String,
         strategy: StrategyConfig,
+        base_decimals: u8,
+        quote_decimals: u8,
     ) -> Self {
         let timestamp = current_timestamp();
         Trade {
             id: Uuid::new_v4(),
-            wallet,
-            pool,
             exchange,
             strategy_name,
             strategy,
+            base_decimals,
+            quote_decimals,
             buy_price: 0.0,
             sell_price: 0.0,
+            wallet: *wallet,
+            pool_keys: pool_keys.clone(),
             status: TradeStatus::Created,
             quote_in_amount: 0.0,
             quote_out_amount: 0.0,
@@ -99,7 +107,7 @@ impl Trade {
         }
 
         // Add buy order in amount to the trade metadata
-        self.quote_in_amount = order.amount_in;
+        self.quote_in_amount = order.amount;
         self.buy_order = Some(order); // Register the buy order for the trade
         self.updated_at = current_timestamp();
 

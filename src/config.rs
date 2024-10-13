@@ -24,6 +24,13 @@ pub struct BloxrouteConfig {
     // If enabled, the bot will use Bloxroute to broadcast
     // transactions to speed up the transaction propagation.
     pub enabled: bool,
+
+    // Configure how the bot will create the swap transactions.
+    // By default, the unsigned tx will be created by the bot,
+    // but if you enable this option Bloxroute will create the
+    // unsigned tx for signing.
+    pub create_swap_tx: bool,
+
     pub url: Option<String>,
     pub ws_url: Option<String>,
     pub auth_token: Option<String>, // Auth token is required when using Bloxroute.
@@ -144,7 +151,7 @@ pub struct StrategyConfig {
     // Configuration for executing orders.
     pub buy_delay: u64, // Delay in milliseconds before executing the buy order.
     pub buy_slippage: f64, // Maximum slippage allowed for the buy order.
-    pub buy_executor: String, // Tx executor, can be "rpc" or "bloxroute"
+    pub buy_executor: ExecutorType, // Tx executor, can be "rpc" or "bloxroute"
 
     pub sell_delay: u64,
     pub sell_slippage: f64,

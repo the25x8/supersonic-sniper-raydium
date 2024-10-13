@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use dashmap::DashMap;
 use log::info;
-use chrono::NaiveDateTime;
+use chrono::{NaiveDateTime, TimeZone};
 use solana_sdk::pubkey::Pubkey;
 use tokio_util::sync::CancellationToken;
 use crate::executor::order::{Order, OrderKind};
@@ -61,14 +61,16 @@ fn get_pending_orders_header() -> String {
 }
 
 fn format_pending_order_row(order: &Order) -> String {
-    let created_at = NaiveDateTime::from_timestamp((order.created_at / 1000) as i64, 0)
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
+    let created_at = chrono::Utc.timestamp_opt(order.created_at as i64, 0)
+        .single()
+        .unwrap()
+        .to_rfc3339();
 
     let execution_time = if order.delayed_at > 0 {
-        NaiveDateTime::from_timestamp((order.delayed_at / 1000) as i64, 0)
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string()
+        chrono::Utc.timestamp_opt(order.delayed_at as i64, 0)
+            .single()
+            .unwrap()
+            .to_rfc3339()
     } else {
         "Immediate".to_string()
     };
@@ -76,11 +78,11 @@ fn format_pending_order_row(order: &Order) -> String {
     format!(
         "{:<36} | {:<44} | {:<10} | {:<12} | {:<12.9} | {:<12.9} | {:<19} | {:<19}",
         order.id,
-        order.pool,
+        order.pool_keys.id.to_string(),
         order.direction,
         order.kind,
-        order.amount_in,
-        order.min_amount_out,
+        order.amount,
+        order.limit_amount,
         created_at,
         execution_time,
     )

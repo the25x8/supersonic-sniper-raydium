@@ -7,16 +7,17 @@ mod error;
 mod info;
 mod solana;
 mod executor;
+mod market;
 
 use detector::Pool;
 
 use std::sync::Arc;
 use clap::{Arg, ArgAction, Command};
 use log::{error, info};
-use solana_client::nonblocking::rpc_client::{RpcClient};
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
 use tokio::signal;
-use tokio::sync::{mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -179,8 +180,9 @@ async fn run_app(shutdown_token: CancellationToken) {
     let tracker = TaskTracker::new();
 
     // Initialize the detector module as a future task
-    let detector_future = detector::Detector::run(
+    let detector_future = detector::run(
         app_config_arc.clone(),
+        rpc_client_arc.clone(),
         pool_tx,
         shutdown_token.clone(),
     );
@@ -196,10 +198,10 @@ async fn run_app(shutdown_token: CancellationToken) {
             );
 
             // Initialize the trader module
-            let trader_config_arc = Arc::new(app_config_arc.trader.clone());
+            let app_config_clone = app_config_arc.clone();
             let rpc_ws_url = app_config_arc.rpc.ws_url.to_string().clone();
             let mut trader = trader::Trader::new(
-                trader_config_arc,
+                app_config_clone,
                 rpc_client_arc.clone(),
                 wallet,
                 pool_rx,
@@ -263,7 +265,7 @@ ____/ // /_/ /__  /_/ /  __/  /        ____/ // /_/ /  / / /  / / /__
 /____/ \__,_/ _  .___/\___//_/         /____/ \____//_/ /_//_/  \___/  
               /_/                                                      
 
-Super Sonic Sniper Bot v0.1 - The High-Speed Trading Bot for Raydium AMM
+Super Sonic Sniper Bot v0.2.0 - The High-Speed Trading Bot for Raydium AMM
 ────────────────────────────────────────────────────────────────────────
 "#
     );

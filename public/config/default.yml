@@ -9,6 +9,12 @@ bloxroute:
   # If enabled, the bot will use Bloxroute to broadcast
   # transactions to speed up the transaction propagation.
   enabled: false
+  
+  # Configure how the bot will create the swap transactions.
+  # By default, the unsigned tx will be created by the bot,
+  # but if you enable this option Bloxroute will create the
+  # unsigned tx for signing.
+  create_swap_tx: true
 
   # Bloxroute URL and WebSocket URL.
   url: "https://uk.solana.dex.blxrbdn.com"
@@ -46,6 +52,9 @@ detector:
 
 # Trader module configuration
 trader:
+  # If enabled, the bot will close all open trades on shutdown by current price.
+  close_trades_on_shutdown: true
+  
   # List of conditions that can be used to choose the strategy.
   # Any condition with a value of 0 or commented out will be ignored.
   strategies:
@@ -137,7 +146,7 @@ trader:
       sell_delay: 0
       buy_slippage: 10.0 # Maximum slippage allowed for the buy order.
       sell_slippage: 50.0
-      buy_executor: "bloxroute" # Tx executor, can be "rpc" or "bloxroute".
+      buy_executor: "rpc" # Tx executor, can be "rpc" or "bloxroute".
       max_retries: 5 # Number of retries if the buy order fails.
       quote_amount: 0.21 # Amount of quote currency to spend.
       sell_percent: 100.0 # Percentage of the base currency to sell.
@@ -148,7 +157,7 @@ trader:
       take_profit: 25.0 # Take profit percentage.
       stop_loss: 10.0 # Stop loss percentage.
       take_profit_executor: "rpc"
-      stop_loss_executor: "bloxroute"
+      stop_loss_executor: "rpc"
 
       # The bribes are used to incentivize the validators to include the transaction
       # in the block. It will be used only if Bloxroute is enabled and auth token is provided.

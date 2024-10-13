@@ -5,26 +5,24 @@ use solana_account_decoder::{UiAccountData, UiAccountEncoding};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::commitment_config::CommitmentConfig;
 use tokio::sync::mpsc::{Receiver, Sender};
-use log::{info, error, debug};
+use log::{debug, error, info, warn};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use base64::Engine;
 use borsh::BorshDeserialize;
-use chrono::Utc;
 use dashmap::{DashMap, DashSet};
 use futures::StreamExt;
-use solana_account_decoder::parse_token::UiTokenAmount;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_filter::RpcFilterType::DataSize;
 use tokio_util::sync::CancellationToken;
 use crate::error::handle_attempt;
-use crate::raydium::{LiquidityStateV4, MainnetProgramId};
+use crate::raydium;
+use crate::detector::PoolKeys;
 use crate::solana::amount_utils::token_amount_to_float;
-use crate::solana::quote_mint::{USDC_MINT, WSOL_MINT};
+use crate::solana::quote_mint::USDC_MINT;
 
 // Maximum retry attempts for fetching data from the blockchain
-const MAX_FETCH_RETRIES: u32 = 5;
 const MAX_SUBSCRIPTION_RETRIES: u32 = 5;
 const RECONNECT_BACKOFF: u64 = 1000; // Reconnection backoff in milliseconds
 
@@ -37,34 +35,13 @@ pub struct MarketData {
     pub timestamp: std::time::Instant,
 }
 
-pub struct MarketStateLayoutV3 {
-    pub base_lot_size: u64,
-    pub quote_lot_size: u64,
-    pub base_vault: Pubkey,
-    pub quote_vault: Pubkey,
-    pub base_mint: Pubkey,
-    pub quote_mint: Pubkey,
-    pub own_address: Pubkey,
-    pub vault_signer_nonce: u64,
-    pub base_deposits_total: u64,
-    pub base_fees_accrued: u64,
-    pub quote_deposits_total: u64,
-    pub quote_fees_accrued: u64,
-    pub quote_dust_threshold: u64,
-    pub request_queue: Pubkey,
-    pub event_queue: Pubkey,
-    pub bids: Pubkey,
-    pub asks: Pubkey,
-    pub fee_rate_bps: u64,
-    pub referrer_rebates_accrued: u64,
-}
-
 pub struct MarketMonitor {
     market_tx: Sender<MarketData>,
     rpc_client: Arc<RpcClient>,
     pubsub_client: Arc<PubsubClient>,
-    watchlist: Arc<DashSet<Pubkey>>,
-    watchlist_update_tx: Sender<Pubkey>,
+    watchlist: Arc<DashMap<Pubkey, PoolKeys>>,
+    watchlist_add_tx: Sender<(Pubkey, PoolKeys)>,
+    watchlist_remove_tx: Sender<Pubkey>,
     prices: Arc<DashMap<Pubkey, (f64, std::time::Instant)>>,
 
     // For cancelling the market monitor task when the bot is stopped
@@ -88,24 +65,30 @@ impl MarketMonitor {
         };
 
         let prices = Arc::new(DashMap::new());
-        let watchlist = Arc::new(DashSet::new());
+        let watchlist = Arc::new(DashMap::new());
         let pubsub_client = Arc::new(pubsub_client);
 
-        let (watchlist_update_tx, watchlist_update_rx) = tokio::sync::mpsc::channel(50);
+        let (watchlist_add_tx, watchlist_add_rx) = tokio::sync::mpsc::channel(20);
+        let (watchlist_remove_tx, watchlist_remove_rx) = tokio::sync::mpsc::channel(20);
         let pubsub_client_clone = pubsub_client.clone();
         let prices_clone = prices.clone();
 
-        // Run the watchlist update task
+        // Run the watchlist add and remove tasks
         let market_data_tx = market_tx.clone();
         let rpc_client_clone = rpc_client.clone();
         let watchlist_clone = watchlist.clone();
         tokio::spawn(async move {
-            Self::watchlist_update_loop(
-                watchlist_update_rx,
+            Self::watchlist_add_loop(
+                watchlist_add_rx,
                 watchlist_clone,
                 market_data_tx,
                 rpc_client_clone,
             ).await;
+        });
+
+        let watchlist_clone = watchlist.clone();
+        tokio::spawn(async move {
+            Self::watchlist_remove_loop(watchlist_remove_rx, watchlist_clone).await;
         });
 
         // Run the main market monitor task
@@ -114,7 +97,7 @@ impl MarketMonitor {
         let watchlist_clone = watchlist.clone();
         let cancel_token_clone = cancel_token.clone();
         tokio::spawn(async move {
-            Self::run(
+            Self::subscribe_to_reserves_pubsub(
                 rpc_client_clone,
                 pubsub_client_clone,
                 market_data_tx,
@@ -131,58 +114,42 @@ impl MarketMonitor {
             rpc_client,
             pubsub_client,
             cancel_token,
-            watchlist_update_tx,
+            watchlist_add_tx,
+            watchlist_remove_tx,
         }
     }
 
-    /// Run tasks for updating the watchlist and fetching initial market data for pools.
-    async fn watchlist_update_loop(
-        mut watchlist_update_rx: Receiver<Pubkey>,
-        watchlist: Arc<DashSet<Pubkey>>,
+    /// Run the watchlist add loop to add pools to the watchlist,
+    /// it also fetches the initial price of the pool and emits it to the market_tx channel.
+    async fn watchlist_add_loop(
+        mut watchlist_update_rx: Receiver<(Pubkey, PoolKeys)>,
+        watchlist: Arc<DashMap<Pubkey, PoolKeys>>,
         market_tx: Sender<MarketData>,
         rpc_client: Arc<RpcClient>,
     ) {
-        while let Some(pubkey) = watchlist_update_rx.recv().await {
+        while let Some((pubkey, pool_keys)) = watchlist_update_rx.recv().await {
             // Add the pool to the watchlist if it doesn't exist
-            let is_add = !watchlist.contains(&pubkey);
-            if is_add {
-                watchlist.insert(pubkey);
+            let exists = !watchlist.contains_key(&pubkey);
+            if exists {
+                watchlist.insert(pubkey, pool_keys);
                 info!("🔍 Pool {} added to watchlist", pubkey);
                 // watchlist lock is dropped here
             } else {
-                // Otherwise, remove the pool from the watchlist
-                watchlist.remove(&pubkey);
-                info!("🔍 Pool {} removed from watchlist", pubkey);
+                // Pool already exists in the watchlist, skip
                 continue;
             }
 
-            // If the pool is being added to the watchlist, fetch the initial market data
-            // Fetch pool data by pubkey
-            let data = match rpc_client.get_account_data(&pubkey).await {
-                Ok(data) => data,
-                Err(e) => {
-                    error!("Failed to fetch account data for pool {}: {}", pubkey, e);
-                    continue;
-                }
-            };
-
-            // Deserialize the account data into a liquidity state
-            let mut state = match LiquidityStateV4::try_from_slice(&data) {
+            // Get liquidity state for the pool
+            let state = match raydium::get_amm_liquidity_state(rpc_client.clone(), &pubkey).await {
                 Ok(state) => state,
                 Err(e) => {
-                    error!("Failed to parse liquidity state v4 data: {}", e);
+                    error!("Failed to fetch AMM liquidity state: {}", e);
                     continue;
                 }
             };
 
-            // Prevent the base token from being USDC or WSOL
-            if state.coin_vault_mint.to_string() == USDC_MINT ||
-                state.coin_vault_mint.to_string() == WSOL_MINT {
-                swap_vaults(&mut state);
-            }
-
             // Fetch the initial price of the pool and emit to the market_tx channel
-            let (base_reserves, quote_reserves) = match get_amm_pool_reserves(
+            let (base_reserves, quote_reserves) = match raydium::get_amm_pool_reserves(
                 rpc_client.clone(),
                 &state.coin_vault,
                 &state.pc_vault,
@@ -195,7 +162,7 @@ impl MarketMonitor {
             };
 
             // Calculate the initial price of the pool
-            let price = match convert_reserves_to_price(&base_reserves, &quote_reserves) {
+            let price = match raydium::convert_reserves_to_price(&base_reserves, &quote_reserves) {
                 Ok(price) => price,
                 Err(e) => {
                     error!("Failed to calculate initial token price: {}", e);
@@ -204,13 +171,13 @@ impl MarketMonitor {
             };
 
             // Emit the initial market data to the market_tx channel
-            let scaled_base_reserves = token_amount_to_float(&base_reserves.amount, base_reserves.decimals);
-            let scaled_quote_reserves = token_amount_to_float(&quote_reserves.amount, quote_reserves.decimals);
+            let base_reserves_amount = token_amount_to_float(&base_reserves.amount, base_reserves.decimals);
+            let quote_reserves_amount = token_amount_to_float(&quote_reserves.amount, quote_reserves.decimals);
             match market_tx.send(MarketData {
                 price,
                 market: pubkey,
-                base_reserves: scaled_base_reserves,
-                quote_reserves: scaled_quote_reserves,
+                base_reserves: base_reserves_amount,
+                quote_reserves: quote_reserves_amount,
                 timestamp: std::time::Instant::now(),
             }).await {
                 Ok(_) => (),
@@ -224,11 +191,24 @@ impl MarketMonitor {
         }
     }
 
-    async fn run(
+    /// Loop to remove pools from the watchlist when requested.
+    async fn watchlist_remove_loop(mut watchlist_remove_rx: Receiver<Pubkey>, watchlist: Arc<DashMap<Pubkey, PoolKeys>>) {
+        while let Some(pubkey) = watchlist_remove_rx.recv().await {
+            // Remove the pool from the watchlist
+            let removed = watchlist.remove(&pubkey);
+            if removed.is_some() {
+                info!("🔍 Pool {} removed from watchlist", pubkey);
+            }
+        }
+    }
+
+    /// The task subscribes to the AMM program, listens for liquidity updates,
+    /// and emits updated market data to the market_tx channel.
+    async fn subscribe_to_reserves_pubsub(
         rpc_client: Arc<RpcClient>,
         pubsub: Arc<PubsubClient>,
         market_tx: Sender<MarketData>,
-        watchlist: Arc<DashSet<Pubkey>>,
+        watchlist: Arc<DashMap<Pubkey, PoolKeys>>,
         prices: Arc<DashMap<Pubkey, (f64, std::time::Instant)>>,
         cancel_token: CancellationToken,
     ) {
@@ -271,27 +251,28 @@ impl MarketMonitor {
             };
 
             // Subscribe to the AMM program
-            let (mut accounts, program_unsubscribe) = match pubsub.program_subscribe(
-                &MainnetProgramId::AmmV4.get_pubkey(),
-                Some(config),
-            ).await {
-                Ok(subscription) => subscription,
-                Err(e) => {
-                    error!("Failed to subscribe to AMM program: {}", e);
+            let (mut accounts, program_unsubscribe) =
+                match pubsub.program_subscribe(
+                    &raydium::MainnetProgramId::AmmV4.get_pubkey(),
+                    Some(config),
+                ).await {
+                    Ok(subscription) => subscription,
+                    Err(e) => {
+                        error!("Failed to subscribe to AMM program: {}", e);
 
-                    // Try to reconnect, and return if max retries exceeded
-                    if let Err(_) = handle_attempt(
-                        &mut attempts,
-                        MAX_SUBSCRIPTION_RETRIES,
-                        RECONNECT_BACKOFF,
-                    ).await {
-                        error!("Max subscription retries for Raydium pool stream in Market Monitor exceeded");
-                        break;
+                        // Try to reconnect, and return if max retries exceeded
+                        if let Err(_) = handle_attempt(
+                            &mut attempts,
+                            MAX_SUBSCRIPTION_RETRIES,
+                            RECONNECT_BACKOFF,
+                        ).await {
+                            error!("Max subscription retries for Raydium pool stream in Market Monitor exceeded");
+                            break;
+                        }
+
+                        continue;
                     }
-
-                    continue;
-                }
-            };
+                };
 
             // Reset the connection attempts counter
             attempts = 0;
@@ -367,16 +348,16 @@ impl MarketMonitor {
     }
 
     /// Add a pool to the watchlist
-    pub async fn add_to_watchlist(&self, pubkey: Pubkey) {
-        if let Err(e) = self.watchlist_update_tx.send(pubkey).await {
-            error!("Failed to send watchlist update: {}", e);
+    pub async fn add_to_watchlist(&self, pubkey: &Pubkey, pool_keys: &PoolKeys) {
+        if let Err(e) = self.watchlist_add_tx.send((*pubkey, pool_keys.clone())).await {
+            error!("Failed to add pool to watchlist: {}", e);
         }
     }
 
     /// Remove a pool from the watchlist
-    pub async fn remove_from_watchlist(&self, pubkey: Pubkey) {
-        if let Err(e) = self.watchlist_update_tx.send(pubkey).await {
-            error!("Failed to send watchlist update: {}", e);
+    pub async fn remove_from_watchlist(&self, pubkey: &Pubkey) {
+        if let Err(e) = self.watchlist_remove_tx.send(*pubkey).await {
+            error!("Failed to remove pool from watchlist: {}", e);
         }
     }
 
@@ -387,14 +368,14 @@ impl MarketMonitor {
         data: &UiAccountData,
         rpc_client: Arc<RpcClient>,
         prices: Arc<DashMap<Pubkey, (f64, std::time::Instant)>>,
-        watchlist: Arc<DashSet<Pubkey>>,
+        watchlist: Arc<DashMap<Pubkey, PoolKeys>>,
         market_tx: Sender<MarketData>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         match data {
             UiAccountData::Binary(data_base64, _encoding) => {
                 if let Ok(data) = base64::prelude::BASE64_STANDARD.decode(data_base64) {
                     // Parse the liquidity state data
-                    let mut state = match LiquidityStateV4::try_from_slice(&data) {
+                    let mut state = match raydium::LiquidityStateV4::try_from_slice(&data) {
                         Ok(state) => state,
                         Err(e) => {
                             error!("Failed to parse liquidity state v4 data: {}", e);
@@ -402,12 +383,12 @@ impl MarketMonitor {
                         }
                     };
 
-                    // Step 1: Check if the pool is in the watchlist
-                    if !watchlist.contains(&pubkey) {
+                    // Check if the pool is in the watchlist
+                    if !watchlist.contains_key(&pubkey) {
                         return Ok(());
                     }
 
-                    // Step 2: Check the cache for price and timestamp
+                    // Check the cache for price and timestamp
                     if let Some(entry) = prices.get(&pubkey) {
                         // If the price hasn't changed in the last 5 seconds, skip fetching
                         if entry.value().1.elapsed() < Duration::from_secs(5) {
@@ -415,27 +396,28 @@ impl MarketMonitor {
                         }
                     }
 
-                    // Prevent the base token from being USDC or WSOL
+                    // Swap the vaults if the coin vault is USDC or WSOL
                     if state.coin_vault_mint.to_string() == USDC_MINT ||
-                        state.coin_vault_mint.to_string() == WSOL_MINT {
-                        swap_vaults(&mut state);
+                        state.coin_vault_mint == spl_token::native_mint::id() {
+                        raydium::swap_amm_pc_and_base(&mut state);
                     }
 
-                    // Step 3: Fetch the reserves of the AMM pool if cache is stale or empty
-                    let (base_reserves, quote_reserves) = match get_amm_pool_reserves(
-                        rpc_client,
-                        &state.coin_vault,
-                        &state.pc_vault,
-                    ).await {
-                        Ok(reserves) => (reserves[0].clone(), reserves[1].clone()),
-                        Err(e) => {
-                            error!("Failed to fetch AMM pool reserves: {}", e);
-                            return Err(e);
-                        }
-                    };
+                    // Fetch the reserves of the AMM pool if cache is stale or empty
+                    let (base_reserves, quote_reserves) =
+                        match raydium::get_amm_pool_reserves(
+                            rpc_client,
+                            &state.coin_vault,
+                            &state.pc_vault,
+                        ).await {
+                            Ok(reserves) => (reserves[0].clone(), reserves[1].clone()),
+                            Err(e) => {
+                                error!("Failed to fetch AMM pool reserves: {}", e);
+                                return Err(e);
+                            }
+                        };
 
-                    // Step 4: Calculate the price of the base token in terms of the quote token
-                    let price = match convert_reserves_to_price(&base_reserves, &quote_reserves) {
+                    // Calculate the price of the base token in terms of the quote token
+                    let price = match raydium::convert_reserves_to_price(&base_reserves, &quote_reserves) {
                         Ok(price) => price,
                         Err(e) => {
                             error!("Failed to calculate token price: {}", e);
@@ -454,7 +436,7 @@ impl MarketMonitor {
                         price
                     );
 
-                    // Step 5: Emit the market data to the market_tx channel
+                    // Send market data to the market_tx channel
                     match market_tx.send(MarketData {
                         price, // New price of base token in terms of quote token
                         market: pubkey,
@@ -481,66 +463,4 @@ impl MarketMonitor {
             }
         }
     }
-}
-
-/// Sometimes the coin vault is USDC or WSOL, which means the base token is the quote token.
-/// In this case, we need to swap the vaults to ensure the base token is not USDC or WSOL.
-fn swap_vaults(state: &mut LiquidityStateV4) {
-    let temp_mint = state.coin_vault_mint;
-    let temp_vault = state.coin_vault;
-    let temp_decimals = state.pc_decimals;
-
-    // Swap the values
-    state.coin_vault_mint = state.pc_vault_mint;
-    state.coin_vault = state.pc_vault;
-    state.coin_decimals = state.pc_decimals;
-
-    state.pc_vault_mint = temp_mint;
-    state.pc_vault = temp_vault;
-    state.pc_decimals = temp_decimals;
-}
-
-pub async fn get_amm_pool_reserves(
-    client: Arc<RpcClient>,
-    base_vault: &Pubkey,
-    quote_vault: &Pubkey,
-) -> Result<Vec<UiTokenAmount>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut attempts = 0;
-
-    loop {
-        // Fetch both base and quote vault balances concurrently
-        let base_vault_future = client.get_token_account_balance(base_vault);
-        let quote_vault_future = client.get_token_account_balance(quote_vault);
-
-        match tokio::join!(base_vault_future, quote_vault_future) {
-            (Ok(base_vault_balance), Ok(quote_vault_balance)) => {
-                return Ok(vec![base_vault_balance, quote_vault_balance]);
-            }
-            (Err(e), _) | (_, Err(e)) => {
-                error!("An error occurred while fetching AMM pool reserves: {}", e);
-
-                // Increment retry attempt counter and handle retry logic
-                match handle_attempt(
-                    &mut attempts,
-                    MAX_FETCH_RETRIES,
-                    100,
-                ).await {
-                    Ok(_) => continue,
-                    Err(_) => return Err(Box::new(e)),
-                }
-            }
-        }
-    }
-}
-
-pub fn convert_reserves_to_price(
-    base_reserves: &UiTokenAmount,
-    quote_reserves: &UiTokenAmount,
-) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-    // Convert base and quote reserves into f64, adjusting for the token decimals
-    let base_reserve: f64 = base_reserves.amount.parse::<f64>()? / 10f64.powi(base_reserves.decimals as i32);
-    let quote_reserve: f64 = quote_reserves.amount.parse::<f64>()? / 10f64.powi(quote_reserves.decimals as i32);
-
-    // Calculate price using the correct reserve amounts
-    Ok(quote_reserve / base_reserve)
 }

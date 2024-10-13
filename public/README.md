@@ -377,6 +377,7 @@ trader:
 
 ## **Additional Tips**
 
+- **Operation Not Permitted**: If you encounter an "Operation not permitted" error on macOS, try running the binary with: `xattr -d com.apple.quarantine ./supersonic-sniper`.
 - **Ensure Network Connectivity**: The bot requires internet access to interact with the Solana blockchain.
 - **Check Permissions**: On macOS/Unix, you may need to grant execution permissions to the binary using `chmod +x`.
 - **Monitor Logs**: Keep an eye on the console output or log files to monitor the bot's activity.

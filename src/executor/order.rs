@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use solana_program::pubkey::Pubkey;
 use crate::config::ExecutorType;
+use crate::detector::Pool;
+use crate::detector::PoolKeys;
 use crate::trader::current_timestamp;
 
 /// The orders are the main building blocks of the trade.
@@ -12,7 +14,7 @@ use crate::trader::current_timestamp;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Order {
     pub id: Uuid,
-    pub pool: Pubkey, // The pool address is a main key for the order
+    pub pool_keys: PoolKeys,
     pub trade_id: Uuid, // The trade ID associated with the order
     pub direction: OrderDirection,
     pub status: OrderStatus,
@@ -22,16 +24,20 @@ pub struct Order {
     // Meta information about the tokens
     pub in_mint: Pubkey,
     pub out_mint: Pubkey,
+    pub in_decimals: u8,
+    pub out_decimals: u8,
 
     // Swap fields are the same for swapIn and swapOut orders
-    pub amount_in: f64,
-    pub min_amount_out: f64,
+    pub amount: f64,
+    pub limit_amount: f64, // Can be min or max amount depending on the order type
 
     // Execution details
     pub executor: ExecutorType,
+    pub executor_bribe: Option<f64>, // Amount paid to the executor for the order
 
     // Blockchain tx details and timestamps
     pub tx_id: Option<String>,
+    pub feed_lamports: Option<u64>,
     pub confirmed_at: u64,
     pub cancelled_at: u64,
     pub created_at: u64,
@@ -43,12 +49,15 @@ impl Order {
         direction: OrderDirection,
         trade_id: Uuid,
         kind: OrderKind,
-        pool: &Pubkey,
-        in_mint: &Pubkey,
-        out_mint: &Pubkey,
+        pool_keys: &PoolKeys,
         amount_in: f64,
         min_amount_out: f64,
+        in_mint: &Pubkey,
+        out_mint: &Pubkey,
+        in_decimals: u8,
+        out_decimals: u8,
         executor: ExecutorType,
+        bribe: Option<f64>,
         delay: u64,
     ) -> Self {
         // Delayed at timestamp is current timestamp + delay if delay is greater than 0.
@@ -62,19 +71,23 @@ impl Order {
             direction,
             delay,
             kind,
-            amount_in,
+            in_decimals,
+            out_decimals,
             trade_id,
-            min_amount_out,
             delayed_at,
             executor,
-            pool: *pool,
+            amount: amount_in,
+            limit_amount: min_amount_out,
             tx_id: None,
             confirmed_at: 0,
             cancelled_at: 0,
             in_mint: *in_mint,
             out_mint: *out_mint,
             status: OrderStatus::Open,
+            pool_keys: pool_keys.clone(),
             created_at: current_timestamp(),
+            executor_bribe: bribe,
+            feed_lamports: None,
         }
     }
 
