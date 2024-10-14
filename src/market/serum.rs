@@ -4,6 +4,7 @@ use log::error;
 use serde::{Deserialize, Serialize};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
+use crate::error::handle_attempt;
 
 #[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize, BorshDeserialize)]
@@ -49,11 +50,16 @@ pub async fn get_serum_market_state(rpc_client: Arc<RpcClient>, market_id: &Pubk
 
     loop {
         // Get program account data for the serum market
-        let serum_market = match rpc_client.get_account(&market_id).await {
+        let serum_market = match rpc_client.get_account(market_id).await {
             Ok(account) => account,
             Err(e) => {
                 error!("Failed to get serum market account: {}", e);
-                return Err(Box::new(e));
+
+                // Increment retry attempt counter and handle retry logic
+                match handle_attempt(&mut attempts, MAX_RETRIES, 300).await {
+                    Ok(_) => continue,
+                    Err(_) => return Err(Box::new(e)),
+                }
             }
         };
 

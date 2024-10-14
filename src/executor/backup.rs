@@ -4,7 +4,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 use dashmap::DashMap;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use solana_sdk::pubkey::Pubkey;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
@@ -80,7 +80,7 @@ impl Backup {
                     }
                     match serde_json::from_str::<HashMap<String, Vec<Order>>>(&data) {
                         Ok(parsed_orders) => {
-                            if parsed_orders.len() > 0 {
+                            if !parsed_orders.is_empty() {
                                 info!("Found {} pending orders", parsed_orders.len());
                             }
 
@@ -94,7 +94,6 @@ impl Backup {
                                         }
                                         Err(e) => {
                                             error!("Failed to parse pubkey {}: {}", pubkey_str, e);
-                                            return;
                                         }
                                     }
                                 });

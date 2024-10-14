@@ -85,7 +85,7 @@ impl Backup {
                     }
                     match serde_json::from_str::<HashMap<String, Vec<Trade>>>(&data) {
                         Ok(parsed_trades) => {
-                            if parsed_trades.len() > 0 {
+                            if !parsed_trades.is_empty() {
                                 info!("Found {} active trades", parsed_trades.len());
                             }
 

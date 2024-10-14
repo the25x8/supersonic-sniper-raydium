@@ -6,7 +6,6 @@ use solana_account_decoder::parse_token::UiTokenAmount;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_program::pubkey::Pubkey;
 use crate::error::handle_attempt;
-use crate::solana::quote_mint::USDC_MINT;
 
 const MAX_FETCH_RETRIES: u32 = 3;
 
@@ -177,7 +176,7 @@ pub async fn get_amm_liquidity_state(rpc_client: Arc<RpcClient>, amm_id: &Pubkey
 
     loop {
         // Get program account data for the Raydium AMM account
-        let data = match rpc_client.get_account_data(&amm_id).await {
+        let data = match rpc_client.get_account_data(amm_id).await {
             Ok(account) => account,
             Err(e) => {
                 error!("Failed to get amm account: {}", e);

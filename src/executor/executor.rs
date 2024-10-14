@@ -5,16 +5,13 @@ use dashmap::DashMap;
 use futures::StreamExt;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use log::{error, info, warn};
-use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_program::pubkey::Pubkey;
-use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
-use solana_sdk::signature::Signature;
-use solana_transaction_status::UiTransactionEncoding;
+use solana_sdk::commitment_config::CommitmentConfig;
 use tokio::sync::mpsc::{Sender};
 use tokio_util::sync::CancellationToken;
 use tokio_util::time::DelayQueue;
 use crate::config::{BloxrouteConfig, ExecutorType};
-use crate::executor::order::{Order, OrderDirection, OrderKind, OrderStatus};
+use crate::executor::order::{Order, OrderDirection, OrderStatus};
 use crate::executor::backup::Backup;
 use crate::executor::{bloxroute, swap};
 use crate::wallet::Wallet;
@@ -196,7 +193,7 @@ async fn execute_order(
     let mut tx = {
         // If enabled and create_swap_tx is true, create the swap tx via Bloxroute API
         if bloxroute_enabled && bloxroute_config.create_swap_tx {
-            match bloxroute::create_swap_tx(&vec![]).await {
+            match bloxroute::create_swap_tx(&[]).await {
                 Ok(tx) => tx,
                 Err(e) => {
                     error!("Failed to create swap tx via Bloxroute: {}", e);

@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use solana_program::pubkey::Pubkey;
 use crate::config::ExecutorType;
-use crate::detector::Pool;
 use crate::detector::PoolKeys;
 use crate::trader::current_timestamp;
 

@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use dashmap::DashMap;
 use log::info;
-use chrono::{NaiveDateTime, TimeZone};
+use chrono::TimeZone;
 use solana_sdk::pubkey::Pubkey;
 use tokio_util::sync::CancellationToken;
-use crate::executor::order::{Order, OrderKind};
+use crate::executor::order::Order;
 use crate::executor::Backup;
 
 pub async fn print_pending_orders() {
@@ -25,8 +25,7 @@ pub async fn print_pending_orders() {
 
     // Collect orders into a vector and sort by created_at timestamp
     let mut orders = pending_orders.iter()
-        .map(|entry| entry.value().clone())
-        .flatten()
+        .flat_map(|entry| entry.value().clone())
         .collect::<Vec<_>>();
 
     // Sort orders by created_at timestamp

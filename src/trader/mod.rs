@@ -199,7 +199,7 @@ impl Trader {
         // Collect the initial pools to be added to the watchlist
         for pool_trades in active_trades.iter() {
             let pool_keys = &pool_trades.value()[0].pool_keys;
-            market_monitor.add_to_watchlist(pool_trades.key(), &pool_keys).await;
+            market_monitor.add_to_watchlist(pool_trades.key(), pool_keys).await;
         }
 
         // Subscribe to market data updates and process them
@@ -375,12 +375,7 @@ impl Trader {
                 // Clone the trades vector
                 let trades_vec = trades_ref.value().clone();
                 // Find the index of the trade in the Vec
-                if let Some(trade) = trades_vec.iter().find(|t| t.id == trade_id) {
-                    Some(trade.clone())
-                } else {
-                    // Trade not found
-                    None
-                }
+                trades_vec.iter().find(|t| t.id == trade_id).cloned()
                 // trades_ref ref is dropped here
             } else {
                 // No trades for this pool
@@ -850,7 +845,7 @@ impl Trader {
             }
 
             // Can the metadata be changed
-            if !strategy.meta_mutable.is_none() && strategy.meta_mutable.unwrap() != params.meta_mutable {
+            if strategy.meta_mutable.is_some() && strategy.meta_mutable.unwrap() != params.meta_mutable {
                 error!("Metadata mutable condition not met");
                 continue;
             }

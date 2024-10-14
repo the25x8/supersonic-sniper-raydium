@@ -68,6 +68,11 @@ ls -lh target/release/supersonic-sniper-bot
 
 This will show a breakdown of which crates are contributing the most to the size of the binary.
 
+ ##### Lint-fix
+```bash
+cargo clippy --fix
+```
+
 #### Cross-Compile for Windows from macOS
 First, install the appropriate target:
 

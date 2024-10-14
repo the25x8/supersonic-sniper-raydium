@@ -5,13 +5,13 @@ use solana_account_decoder::{UiAccountData, UiAccountEncoding};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::commitment_config::CommitmentConfig;
 use tokio::sync::mpsc::{Receiver, Sender};
-use log::{debug, error, info, warn};
+use log::{error, info};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use base64::Engine;
 use borsh::BorshDeserialize;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use futures::StreamExt;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_filter::RpcFilterType::DataSize;
@@ -20,7 +20,6 @@ use crate::error::handle_attempt;
 use crate::{market, raydium};
 use crate::detector::PoolKeys;
 use crate::solana::amount_utils::token_amount_to_float;
-use crate::solana::quote_mint::USDC_MINT;
 
 const PRICE_CACHE_TTL: u64 = 2500; // Price cache time-to-live in milliseconds
 
@@ -382,7 +381,7 @@ impl MarketMonitor {
             UiAccountData::Binary(data_base64, _encoding) => {
                 if let Ok(data) = base64::prelude::BASE64_STANDARD.decode(data_base64) {
                     // Parse the liquidity state data
-                    let mut state = match raydium::LiquidityStateV4::try_from_slice(&data) {
+                    let state = match raydium::LiquidityStateV4::try_from_slice(&data) {
                         Ok(state) => state,
                         Err(e) => {
                             error!("Failed to parse liquidity state v4 data: {}", e);

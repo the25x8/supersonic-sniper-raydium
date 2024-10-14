@@ -10,7 +10,6 @@ pub use liquidity::{
 };
 
 use std::str::FromStr;
-use serde::{Deserialize, Serialize};
 use solana_program::pubkey::Pubkey;
 
 

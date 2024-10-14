@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::error::Error;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -20,11 +19,10 @@ use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::transaction::VersionedTransaction;
-use solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, UiInstruction, UiMessage, UiTransaction, UiTransactionEncoding};
+use solana_transaction_status::{EncodedTransaction, UiTransactionEncoding};
 use tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tokio::sync::mpsc::Sender;
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use crate::config::BloxrouteConfig;
 use crate::raydium::MainnetProgramId;

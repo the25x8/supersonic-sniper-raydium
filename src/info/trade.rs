@@ -4,11 +4,11 @@ use dashmap::DashMap;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use log::info;
-use chrono::{NaiveDateTime, TimeZone};
+use chrono::TimeZone;
 use solana_sdk::pubkey::Pubkey;
 use tokio_util::sync::CancellationToken;
-use crate::executor::order::{Order, OrderKind, OrderStatus};
-use crate::trader::trade::{Trade, TradeStatus};
+use crate::executor::order::Order;
+use crate::trader::trade::Trade;
 use crate::trader::backup::Backup;
 
 pub async fn print_trade_info(query: &str) {

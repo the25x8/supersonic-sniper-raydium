@@ -39,7 +39,7 @@ pub fn adjust_tokens_and_calculate_price(
 
     // Now, quote token is WSOL/USDC
     // Calculate the price
-    let price = quote_reserves / base_reserves;
+    
 
-    price
+    quote_reserves / base_reserves
 }

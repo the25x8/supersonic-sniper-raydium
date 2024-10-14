@@ -68,14 +68,12 @@ pub async fn build_swap_in_tx(
     // Include a bribe transfer instruction if order executor is a bloxroute.
     // Only if bloxroute feature is enabled.
     if bloxroute_enabled {
-        if let Err(err) = add_bloxroute_bribe(
+        add_bloxroute_bribe(
             payer,
             &mut instructions,
             order.executor.clone(),
-            order.executor_bribe.clone(),
-        ) {
-            return Err(err);
-        }
+            order.executor_bribe,
+        )?
     }
 
     // Create tx with payer as the signer
@@ -142,14 +140,12 @@ pub async fn build_swap_out_tx(
     // Include a bribe transfer instruction if order executor is a bloxroute.
     // Only if bloxroute feature is enabled.
     if bloxroute_enabled {
-        if let Err(err) = add_bloxroute_bribe(
+        add_bloxroute_bribe(
             payer,
             &mut instructions,
             order.executor.clone(),
-            order.executor_bribe.clone(),
-        ) {
-            return Err(err);
-        }
+            order.executor_bribe,
+        )?
     }
 
     // Create tx with payer as the signer

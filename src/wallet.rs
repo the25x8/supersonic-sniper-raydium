@@ -1,10 +1,8 @@
-use solana_sdk::signature::{read_keypair, Keypair};
+use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 use solana_sdk::pubkey::Pubkey;
 use std::error::Error;
-use std::sync::Arc;
 use anyhow::format_err;
-use crate::config::AppConfig;
 
 /// Struct to hold the wallet information.
 /// Contains the Keypair and associated public key.

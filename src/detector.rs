@@ -2,7 +2,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use chrono::DateTime;
 use dashmap::DashSet;
-use log::{debug, error, info};
+use log::{error, info};
 use mpl_token_metadata::accounts::Metadata;
 use serde::{Deserialize, Serialize};
 use solana_account_decoder::parse_token::UiTokenAmount;
@@ -176,7 +176,7 @@ pub async fn run(
                 if processed_pool_cache.contains(&pool.keys.id) {
                     continue
                 } else {
-                    processed_pool_cache.insert(pool.keys.id.clone());
+                    processed_pool_cache.insert(pool.keys.id);
                 }
 
                 // Adjust quote and base token mints if base mint is WSOL or USDC
@@ -269,8 +269,8 @@ pub async fn run(
                         pool.quote_decimals = spl_token::native_mint::DECIMALS;
 
                         // Calculate price using the correct reserve amounts
-                        pool.base_reserves = pool.base_reserves / 10_usize.pow(pool.base_decimals as u32) as f64;
-                        pool.quote_reserves = pool.quote_reserves / 10_usize.pow(pool.quote_decimals as u32) as f64;
+                        pool.base_reserves /= 10_usize.pow(pool.base_decimals as u32) as f64;
+                        pool.quote_reserves /= 10_usize.pow(pool.quote_decimals as u32) as f64;
                         pool.initial_price = pool.quote_reserves / pool.base_reserves;
 
                         // Calculate the price of base token in terms of quote token
@@ -337,7 +337,7 @@ pub async fn run(
             }
         } => {}
 
-        else => return,
+        else => (),
     );
 }
 
