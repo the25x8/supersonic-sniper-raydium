@@ -4,10 +4,8 @@ mod liquidity;
 
 pub use instructions::{build_swap_in_instruction, build_swap_out_instruction};
 pub use liquidity::{
-    convert_reserves_to_price,
     get_amm_liquidity_state,
     get_amm_pool_reserves,
-    swap_amm_pc_and_base,
     LiquidityStateV4,
 };
 

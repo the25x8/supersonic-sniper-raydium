@@ -1,10 +1,8 @@
 use std::str::FromStr;
-use std::sync::Arc;
-use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_program::instruction::Instruction;
 use solana_program::pubkey::Pubkey;
 use solana_program::system_instruction;
-use spl_associated_token_account::instruction as ata_instruction;
+use spl_associated_token_account::{get_associated_token_address, instruction as ata_instruction};
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::Transaction;
@@ -22,7 +20,7 @@ pub async fn build_swap_in_tx(
     let payer_pubkey = payer.pubkey();
 
     // Get the associated token account address for the out mint
-    let user_token_destination = spl_associated_token_account::get_associated_token_address(
+    let user_token_destination = get_associated_token_address(
         &payer_pubkey,
         &order.out_mint,
     );
@@ -36,7 +34,7 @@ pub async fn build_swap_in_tx(
     );
 
     // User token source is the associated token account for the quote currency
-    let user_token_source = spl_associated_token_account::get_associated_token_address(
+    let user_token_source = get_associated_token_address(
         &payer_pubkey,
         &order.in_mint,
     );
@@ -96,24 +94,24 @@ pub async fn build_swap_out_tx(
     // Get the associated token account address for the base mint
     let user_token_destination = spl_associated_token_account::get_associated_token_address(
         &payer_pubkey,
-        &order.in_mint,
+        &order.out_mint,
     );
 
     // User token source is the associated token account for the quote currency
     let user_token_source = spl_associated_token_account::get_associated_token_address(
         &payer_pubkey,
-        &order.out_mint,
+        &order.in_mint,
     );
 
     // Build swapOut instruction
-    let scaled_amount_in = spl_token::ui_amount_to_amount(order.amount, order.in_decimals);
-    let scaled_min_amount_out = spl_token::ui_amount_to_amount(order.limit_amount, order.out_decimals);
+    let scaled_amount_out = spl_token::ui_amount_to_amount(order.amount, order.in_decimals);
+    let scaled_max_amount_in = spl_token::ui_amount_to_amount(order.limit_amount, order.out_decimals);
     let swap_out_instruction = build_swap_out_instruction(
         &payer_pubkey, // Current wallet
         &user_token_source,
         &user_token_destination,
-        scaled_amount_in,
-        scaled_min_amount_out,
+        scaled_amount_out,
+        scaled_max_amount_in,
         &order.pool_keys,
         4,
     );
@@ -140,7 +138,7 @@ pub async fn build_swap_out_tx(
         swap_out_instruction,
         close_account_ix,
     ];
-    
+
     // Include a bribe transfer instruction if order executor is a bloxroute.
     // Only if bloxroute feature is enabled.
     if bloxroute_enabled {
@@ -178,6 +176,7 @@ fn add_bloxroute_bribe(
 
     // Include a bribe transfer instruction if order executor is a bloxroute.
     let bloxroute_wallet = Pubkey::from_str("HWEoBxYs7ssKuudEjzjmpfJVX7Dvi7wescFsVx2L5yoY")?;
+    // bribe in lamports = 0.0001 SOL = 100_000 lamports
     let scaled_bribe_amount = spl_token::ui_amount_to_amount(bribe_amount, 9); // 9 decimals
     let bribe_transfer_ix = system_instruction::transfer(
         &payer.pubkey(),

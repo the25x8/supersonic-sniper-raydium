@@ -191,23 +191,13 @@ pub async fn get_amm_liquidity_state(rpc_client: Arc<RpcClient>, amm_id: &Pubkey
         };
 
         // Deserialize the serum market data
-        let mut state = match LiquidityStateV4::try_from_slice(&data) {
+        match LiquidityStateV4::try_from_slice(&data) {
             Ok(amm_data) => amm_data,
             Err(e) => {
                 error!("Failed to unpack amm data: {}", e);
                 return Err(Box::new(e));
             }
         };
-
-        // Sometimes the coin vault is USDC or WSOL, which means the base token is the quote token.
-        // In this case, we need to swap the vaults to ensure the base token is not USDC or WSOL.
-        // Fix the vaults if the coin vault is USDC or WSOL.
-        if state.coin_vault_mint.to_string() == USDC_MINT ||
-            state.coin_vault_mint == spl_token::native_mint::id() {
-            swap_amm_pc_and_base(&mut state);
-        }
-
-        return Ok(state);
     }
 }
 
@@ -240,30 +230,3 @@ pub async fn get_amm_pool_reserves(
     }
 }
 
-pub fn convert_reserves_to_price(
-    base_reserves: &UiTokenAmount,
-    quote_reserves: &UiTokenAmount,
-) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-    // Convert base and quote reserves into f64, adjusting for the token decimals
-    let base_reserve: f64 = base_reserves.amount.parse::<f64>()? / 10f64.powi(base_reserves.decimals as i32);
-    let quote_reserve: f64 = quote_reserves.amount.parse::<f64>()? / 10f64.powi(quote_reserves.decimals as i32);
-
-    // Calculate price using the correct reserve amounts
-    Ok(quote_reserve / base_reserve)
-}
-
-/// Swap the coin and pc vaults in the AMM state to ensure the base token is not USDC or WSOL.
-pub fn swap_amm_pc_and_base(state: &mut LiquidityStateV4) {
-    let temp_mint = state.coin_vault_mint;
-    let temp_vault = state.coin_vault;
-    let temp_decimals = state.pc_decimals;
-
-    // Swap the values
-    state.coin_vault_mint = state.pc_vault_mint;
-    state.coin_vault = state.pc_vault;
-    state.coin_decimals = state.pc_decimals;
-
-    state.pc_vault_mint = temp_mint;
-    state.pc_vault = temp_vault;
-    state.pc_decimals = temp_decimals;
-}

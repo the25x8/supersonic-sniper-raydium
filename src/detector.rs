@@ -11,13 +11,13 @@ use solana_program::program_option::COption;
 use solana_program::program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::state::Mint;
-use tokio::sync::{mpsc};
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use crate::config::AppConfig;
 use crate::market::serum;
 use crate::error::handle_attempt;
-use crate::raydium;
+use crate::{market, raydium};
 use crate::raydium::{detector, MainnetProgramId};
 use crate::solana::amount_utils::token_amount_to_float;
 use crate::solana::quote_mint::USDC_MINT;
@@ -140,7 +140,6 @@ pub async fn run(
         watchlist.insert(Pubkey::from_str(token).unwrap());
     });
 
-
     // Create the internal detected pool channel
     let (internal_tx, mut internal_rx) = mpsc::channel::<DetectedPool>(10);
 
@@ -173,55 +172,53 @@ pub async fn run(
                 let mut pool = detected_pool.data;
                 let start_time = chrono::Utc::now().time();
 
-                // If pool is already in the processed pool cache, skip it
+                // If pool is already in the processed pool cache, skip it.
                 if processed_pool_cache.contains(&pool.keys.id) {
                     continue
                 } else {
                     processed_pool_cache.insert(pool.keys.id.clone());
                 }
 
-                // In some pools base and quote are reversed, quote should always be USDC/WSOL.
-                // Otherwise, we need to swap the values to avoid confusion.
-                if pool.keys.base_mint.to_string() == USDC_MINT || pool.keys.base_mint == spl_token::native_mint::id() {
-                    let temp_mint = pool.keys.base_mint;
-                    let temp_vault = pool.keys.base_vault;
-                    let temp_reserves = pool.base_reserves;
-                    let temp_decimals = pool.base_decimals;
+                // Adjust quote and base token mints if base mint is WSOL or USDC
+                // to prevent fetching base and metadata data for these mints.
+                // Get real base mint.
+                let base_mint = {
+                    // If base mint is WSOL or USDC, the real base mint is quote mint.
+                    if pool.keys.base_mint == spl_token::native_mint::id() || pool.keys.base_mint.to_string() == USDC_MINT {
+                        pool.keys.quote_mint;
+                    }
 
-                    // Swap the values
-                    pool.keys.base_mint = pool.keys.quote_mint;
-                    pool.keys.base_vault = pool.keys.quote_vault;
-                    pool.base_reserves = pool.quote_reserves;
-                    pool.base_decimals = pool.quote_decimals;
-
-                    pool.keys.quote_mint = temp_mint;
-                    pool.keys.quote_vault = temp_vault;
-                    pool.quote_reserves = temp_reserves;
-                    pool.quote_decimals = temp_decimals;
-                }
+                    // Otherwise, use the base mint.
+                    pool.keys.base_mint
+                };
 
                 // If watchlist is set, allow only pools with base or quote token in the watchlist
                 if !watchlist.is_empty() {
                     // Skip if the pool is not in the watchlist
-                    if !watchlist.contains(&pool.keys.base_mint) {
+                    if !watchlist.contains(&base_mint) {
                         continue
                     }
 
                     // Mark the pool as in the watchlist
                     pool.in_whitelist = true;
-                } else if !initialized_pool_cache.contains(&pool.keys.id) {
-                    // If watchlist is empty check if the base mint exists in the initialized mint cache.
-                    // Otherwise, it's a pool that was initialized before the detector started. Skip it.
+                }
+
+                let is_pubsub = detected_pool.source == SourceType::PubSub;
+
+                // If pool is not in watchlist and source is PubSub, we need to check if the pool key
+                // is in the initialized pool cache. That's the way how we can filter out the pools
+                // that were initialized after the detector started.
+                if is_pubsub && !pool.in_whitelist && !initialized_pool_cache.contains(&pool.keys.id) {
                     continue
                 }
-                
+
                 // Process all async operations in the tokio task
                 let tx_clone = tx.clone();
                 let rpc_client = client.clone();
                 tokio::spawn(async move {
                     // Based on the detected pool source, fetch the required data.
                     // In case of PubSub fetch reserves, market data and token metadata.
-                    if detected_pool.source == SourceType::PubSub {
+                    if is_pubsub {
                         // Fetch all the required data concurrently
                         let (
                             pool_reserves_result,
@@ -235,10 +232,10 @@ pub async fn run(
                                 &pool.keys.quote_vault,
                             ),
                             serum::get_serum_market_state(rpc_client.clone(), &pool.keys.market_id),
-                            get_token_metadata(rpc_client.clone(), &pool.keys.base_mint),
-                            get_token_mint(rpc_client.clone(), &pool.keys.base_mint)
+                            get_token_metadata(rpc_client.clone(), &base_mint),
+                            get_token_mint(rpc_client.clone(), &base_mint)
                         );
-    
+
                         // Update the pool data with the results
                         update_pool_by_results(
                             &mut pool,
@@ -254,10 +251,10 @@ pub async fn run(
                             token_metadata_result,
                             token_mint_result
                         ) = tokio::join!(
-                            get_token_metadata(rpc_client.clone(), &pool.keys.base_mint),
-                            get_token_mint(rpc_client.clone(), &pool.keys.base_mint)
+                            get_token_metadata(rpc_client.clone(), &base_mint),
+                            get_token_mint(rpc_client.clone(), &base_mint)
                         );
-    
+
                         // Update the pool data with the results
                         update_pool_by_results(
                             &mut pool,
@@ -266,19 +263,29 @@ pub async fn run(
                             Some(token_mint_result),
                             Some(token_metadata_result),
                         );
-    
+
                         // Set quote token decimals to WSOL decimals.
                         // TODO Check is quote WSOL or USDC and set decimals accordingly
                         pool.quote_decimals = spl_token::native_mint::DECIMALS;
-    
+
                         // Calculate price using the correct reserve amounts
-                        pool.base_reserves =   pool.base_reserves / 10_usize.pow(pool.base_decimals as u32) as f64;
+                        pool.base_reserves = pool.base_reserves / 10_usize.pow(pool.base_decimals as u32) as f64;
                         pool.quote_reserves = pool.quote_reserves / 10_usize.pow(pool.quote_decimals as u32) as f64;
-                        pool.initial_price = pool.base_reserves / pool.quote_reserves;
-    
+                        pool.initial_price = pool.quote_reserves / pool.base_reserves;
+
+                        // Calculate the price of base token in terms of quote token
+                        pool.initial_price = market::price::adjust_tokens_and_calculate_price(
+                            pool.keys.base_mint,
+                            pool.keys.quote_mint,
+                            pool.base_reserves,
+                            pool.quote_reserves,
+                        );
+
                         // All other data is already set by the Raydium detector.
                     }
-    
+
+                    error!("BASE SUPPLY: {}", pool.base_supply);
+
                     // Print all the information
                     info!(
                         "\n🔵 [POOL DETECTED] New Raydium Pool Identified!\n\
@@ -287,10 +294,11 @@ pub async fn run(
                          🌍 Source:             {}\n\
                          📊 Type:               {}\n\
                          ⏳ Open Time:          {}\n\
-                         ▶️ Mint:               {}\n\
-                         ▶️ Pooled Tokens:      {}\n\
-                         ▶️ Pooled Base:        {}\n\
-                         ▶️ Token Price:        {:.10}\n\
+                         ▶️ Mint A:             {}\n\
+                         ▶️ Mint B:             {}\n\
+                         ▶️ Reserves A:         {}\n\
+                         ▶️ Reserves B:         {}\n\
+                         ▶️ Token Price:        {:.10} WSOL\n\
                          ▶️ Symbol:             {}\n\
                          ▶️ Supply:             {}\n\
                          ▶️ Decimals:           {}\n\
@@ -307,6 +315,7 @@ pub async fn run(
                         },
                         pool.open_time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                         pool.keys.base_mint.to_string(),
+                        pool.keys.quote_mint.to_string(),
                         pool.base_reserves.to_string(),
                         pool.quote_reserves.to_string(),
                         pool.initial_price,
@@ -319,10 +328,10 @@ pub async fn run(
                         if pool.base_meta_mutable { "Yes" } else { "No" },
                         (chrono::Utc::now().time() - start_time).num_milliseconds()
                     );
-    
+
                     // Send the detected pool data to the bot pool channel
                     if let Err(e) = tx_clone.send(pool).await {
-                        error!("Failed to send detected pool to bot pool channel: {:?}", e);
+                        error!("Failed to send detected pool to bot pool channel: {}", e.to_string());
                     }
                 });
             }
@@ -334,6 +343,8 @@ pub async fn run(
 
 async fn get_token_mint(client: Arc<RpcClient>, token_mint: &Pubkey) -> Result<Mint, Box<dyn std::error::Error + Send + Sync>> {
     let mut attempts = 0;
+
+    error!("GETTING TOKEN MINT FOR: {}", token_mint);
 
     loop {
         // Get the account data for the token vault mint
@@ -422,8 +433,13 @@ fn update_pool_by_results(
         pool.base_reserves = token_amount_to_float(&base_reserves.amount, pool.base_decimals);
         pool.quote_reserves = token_amount_to_float(&quote_reserves.amount, pool.quote_decimals);
 
-        // Calculate the price of token1 in terms of token2
-        pool.initial_price = match raydium::convert_reserves_to_price(&base_reserves, &quote_reserves) {
+        // Calculate the price of base token in terms of quote token
+        pool.initial_price = match market::price::convert_reserves_to_price(
+            pool.keys.base_mint,
+            pool.keys.quote_mint,
+            &base_reserves,
+            &quote_reserves,
+        ) {
             Ok(price) => price,
             Err(e) => {
                 error!("Failed to calculate token price: {}", e);
@@ -472,7 +488,6 @@ fn update_pool_by_results(
         pool.base_mint_renounced = base_mint.mint_authority == COption::None;
         pool.base_mint_authority = base_mint.mint_authority.unwrap_or_default();
     }
-
 
     // Collect the token metadata
     if let Some(token_metadata_result) = token_metadata_result {

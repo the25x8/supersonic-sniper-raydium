@@ -154,7 +154,7 @@ fn format_timestamp(timestamp: u64) -> String {
 fn get_orders_header() -> String {
     format!(
         "{:<36} | {:<10} | {:<12} | {:<12} | {:<14} | {:<14} | {:<19} | {:<19}",
-        "Order ID", "Direction", "Kind", "Amount In", "Min Amount Out", "Status", "Created At", "Executed At"
+        "Order ID", "Direction", "Kind", "Amount In", "Limit Amount", "Status", "Created At", "Executed At"
     )
 }
 
@@ -167,7 +167,7 @@ fn format_order_row(order: &Order) -> String {
     };
 
     format!(
-        "{:<36} | {:<10} | {:<12} | {:<12.4} | {:<14.4} | {:<14} | {:<19} | {:<19}",
+        "{:<36} | {:<10} | {:<12} | {:<12.9} | {:<14.9} | {:<14} | {:<19} | {:<19}",
         order.id,
         order.direction,
         order.kind,

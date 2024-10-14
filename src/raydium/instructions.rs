@@ -1,7 +1,22 @@
+use borsh_derive::BorshSerialize;
 use solana_program::instruction::{AccountMeta, Instruction};
 use solana_program::pubkey::Pubkey;
 use crate::detector::PoolKeys;
 use crate::raydium::MainnetProgramId;
+
+#[derive(BorshSerialize)]
+struct SwapInInstruction {
+    instruction: u8,
+    amount_in: u64,
+    min_amount_out: u64,
+}
+
+#[derive(BorshSerialize)]
+struct SwapOutInstruction {
+    instruction: u8,
+    max_amount_in: u64,
+    amount_out: u64,
+}
 
 // Functions for building swap instructions would go here
 pub fn build_swap_in_instruction(
@@ -55,13 +70,10 @@ pub fn build_swap_in_instruction(
     }
 
     // Instruction data
-    let instruction_data = {
-        // Instruction ID for swap_base_in is 9
-        let mut data = vec![];
-        data.push(9u8); // Instruction ID for swap_base_in
-        data.extend_from_slice(&amount_in.to_le_bytes());
-        data.extend_from_slice(&min_amount_out.to_le_bytes());
-        data
+    let instruction_data = SwapInInstruction {
+        instruction: 9u8,
+        amount_in,
+        min_amount_out,
     };
 
     Instruction::new_with_borsh(amm_program_id, &instruction_data, accounts)
@@ -114,13 +126,10 @@ pub fn build_swap_out_instruction(
     }
 
     // Instruction data
-    let instruction_data = {
-        // Instruction ID for swap_base_in is 9
-        let mut data = vec![];
-        data.push(11u8); // Instruction ID for swap_base_out
-        data.extend_from_slice(&max_amount_in.to_le_bytes());
-        data.extend_from_slice(&amount_out.to_le_bytes());
-        data
+    let instruction_data = SwapOutInstruction {
+        instruction: 11u8, // swap_out instruction ID
+        max_amount_in,
+        amount_out,
     };
 
     Instruction::new_with_borsh(amm_program_id, &instruction_data, accounts)

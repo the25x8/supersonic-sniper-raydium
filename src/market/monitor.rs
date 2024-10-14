@@ -17,10 +17,12 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_filter::RpcFilterType::DataSize;
 use tokio_util::sync::CancellationToken;
 use crate::error::handle_attempt;
-use crate::raydium;
+use crate::{market, raydium};
 use crate::detector::PoolKeys;
 use crate::solana::amount_utils::token_amount_to_float;
 use crate::solana::quote_mint::USDC_MINT;
+
+const PRICE_CACHE_TTL: u64 = 2500; // Price cache time-to-live in milliseconds
 
 // Maximum retry attempts for fetching data from the blockchain
 const MAX_SUBSCRIPTION_RETRIES: u32 = 5;
@@ -28,7 +30,7 @@ const RECONNECT_BACKOFF: u64 = 1000; // Reconnection backoff in milliseconds
 
 #[derive(Debug)]
 pub struct MarketData {
-    pub market: Pubkey,
+    pub pool: Pubkey,
     pub price: f64,
     pub base_reserves: f64,
     pub quote_reserves: f64,
@@ -129,8 +131,8 @@ impl MarketMonitor {
     ) {
         while let Some((pubkey, pool_keys)) = watchlist_update_rx.recv().await {
             // Add the pool to the watchlist if it doesn't exist
-            let exists = !watchlist.contains_key(&pubkey);
-            if exists {
+            let exists = watchlist.contains_key(&pubkey);
+            if !exists {
                 watchlist.insert(pubkey, pool_keys);
                 info!("🔍 Pool {} added to watchlist", pubkey);
                 // watchlist lock is dropped here
@@ -162,7 +164,12 @@ impl MarketMonitor {
             };
 
             // Calculate the initial price of the pool
-            let price = match raydium::convert_reserves_to_price(&base_reserves, &quote_reserves) {
+            let price = match market::price::convert_reserves_to_price(
+                state.coin_vault_mint,
+                state.pc_vault_mint,
+                &base_reserves,
+                &quote_reserves,
+            ) {
                 Ok(price) => price,
                 Err(e) => {
                     error!("Failed to calculate initial token price: {}", e);
@@ -175,7 +182,7 @@ impl MarketMonitor {
             let quote_reserves_amount = token_amount_to_float(&quote_reserves.amount, quote_reserves.decimals);
             match market_tx.send(MarketData {
                 price,
-                market: pubkey,
+                pool: pubkey,
                 base_reserves: base_reserves_amount,
                 quote_reserves: quote_reserves_amount,
                 timestamp: std::time::Instant::now(),
@@ -388,18 +395,12 @@ impl MarketMonitor {
                         return Ok(());
                     }
 
-                    // Check the cache for price and timestamp
+                    // If price is cached, skip fetching
                     if let Some(entry) = prices.get(&pubkey) {
                         // If the price hasn't changed in the last 5 seconds, skip fetching
-                        if entry.value().1.elapsed() < Duration::from_secs(5) {
+                        if entry.value().1.elapsed() < Duration::from_millis(PRICE_CACHE_TTL) {
                             return Ok(());
                         }
-                    }
-
-                    // Swap the vaults if the coin vault is USDC or WSOL
-                    if state.coin_vault_mint.to_string() == USDC_MINT ||
-                        state.coin_vault_mint == spl_token::native_mint::id() {
-                        raydium::swap_amm_pc_and_base(&mut state);
                     }
 
                     // Fetch the reserves of the AMM pool if cache is stale or empty
@@ -417,7 +418,12 @@ impl MarketMonitor {
                         };
 
                     // Calculate the price of the base token in terms of the quote token
-                    let price = match raydium::convert_reserves_to_price(&base_reserves, &quote_reserves) {
+                    let price = match market::price::convert_reserves_to_price(
+                        state.coin_vault_mint,
+                        state.pc_vault_mint,
+                        &base_reserves,
+                        &quote_reserves,
+                    ) {
                         Ok(price) => price,
                         Err(e) => {
                             error!("Failed to calculate token price: {}", e);
@@ -425,7 +431,7 @@ impl MarketMonitor {
                         }
                     };
 
-                    debug!(
+                    info!(
                         "Market data updated for pool {}\n\
                         Base reserves: {}\n\
                         Quote reserves: {}\n\
@@ -439,7 +445,7 @@ impl MarketMonitor {
                     // Send market data to the market_tx channel
                     match market_tx.send(MarketData {
                         price, // New price of base token in terms of quote token
-                        market: pubkey,
+                        pool: pubkey,
                         base_reserves: f64::from_str(&base_reserves.amount)?,
                         quote_reserves: f64::from_str(&quote_reserves.amount)?,
                         timestamp: std::time::Instant::now(),

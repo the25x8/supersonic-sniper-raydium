@@ -15,7 +15,8 @@ use crate::detector::{Pool};
 use crate::solana::quote_mint::USDC_MINT;
 use crate::executor::Executor;
 use crate::executor::order::{Order, OrderDirection, OrderKind, OrderStatus};
-use crate::raydium::{convert_reserves_to_price, get_amm_pool_reserves};
+use crate::market;
+use crate::raydium::{get_amm_pool_reserves};
 use crate::market::monitor::{MarketData, MarketMonitor};
 use crate::trader::backup::Backup;
 use crate::trader::trade::{Trade, TradeExchange};
@@ -196,18 +197,17 @@ impl Trader {
         mut market_data_rx: Receiver<MarketData>,
     ) {
         // Collect the initial pools to be added to the watchlist
-        let active_trades_clone = active_trades.clone();
-        active_trades_clone.clone().iter().for_each(|t| {
-            let pool_keys = t.value()[0].pool_keys.clone();
-            let _ = market_monitor.add_to_watchlist(t.key(), &pool_keys);
-        });
+        for pool_trades in active_trades.iter() {
+            let pool_keys = &pool_trades.value()[0].pool_keys;
+            market_monitor.add_to_watchlist(pool_trades.key(), &pool_keys).await;
+        }
 
         // Subscribe to market data updates and process them
         let active_trades = active_trades.clone();
         tokio::spawn(async move {
             while let Some(market_data) = market_data_rx.recv().await {
                 // Process the trades for the current market
-                if let Some(trades_list) = active_trades.get(&market_data.market) {
+                if let Some(trades_list) = active_trades.get(&market_data.pool) {
                     for trade in trades_list.iter() {
                         debug!(
                             "\n\
@@ -402,13 +402,20 @@ impl Trader {
             &trade.pool_keys.base_vault,
             &trade.pool_keys.quote_vault,
         ).await {
-            Ok(reserves) => match convert_reserves_to_price(&reserves[0], &reserves[1]) {
-                Ok(price) => price,
-                Err(e) => {
-                    error!("Failed to get current price: {}", e);
-                    return;
+            Ok(reserves) => {
+                match market::price::convert_reserves_to_price(
+                    trade.pool_keys.base_mint,
+                    trade.pool_keys.quote_mint,
+                    &reserves[0],
+                    &reserves[1],
+                ) {
+                    Ok(price) => price,
+                    Err(e) => {
+                        error!("Failed to get current price: {}", e);
+                        return;
+                    }
                 }
-            },
+            }
             Err(e) => {
                 error!("Failed to get current price: {}", e);
                 return;
@@ -832,28 +839,32 @@ impl Trader {
         for (name, strategy) in strategies.iter() {
             // Check should the token be freezable
             if strategy.freezable != params.freezable {
-                debug!("Freezable condition not met");
+                error!("Freezable condition not met");
                 continue;
             }
 
             // Can the mint authority mint new tokens
             if strategy.mint_renounced != params.mint_renounced {
-                debug!("Mint renounced condition not met");
+                error!("Mint renounced condition not met");
                 continue;
             }
 
             // Can the metadata be changed
             if !strategy.meta_mutable.is_none() && strategy.meta_mutable.unwrap() != params.meta_mutable {
-                debug!("Metadata mutable condition not met");
+                error!("Metadata mutable condition not met");
                 continue;
             }
 
             // Check quote symbol conditions
             if let Some(quote_symbol) = strategy.quote_symbol.clone() {
-                // Check is the quote mint is wrapped SOL or USDC
-                if (quote_symbol == "WSOL" && params.pool.keys.quote_mint != spl_token::native_mint::id()) ||
-                    (quote_symbol == "USDC" && params.pool.keys.quote_mint.to_string() != USDC_MINT) {
-                    debug!("Quote symbol condition not met");
+                // Check if the quote mint or base mint is wrapped SOL or USDC
+                if (quote_symbol == "WSOL" &&
+                    params.pool.keys.quote_mint != spl_token::native_mint::id() &&
+                    params.pool.keys.base_mint != spl_token::native_mint::id()) ||
+                    (quote_symbol == "USDC" &&
+                        params.pool.keys.quote_mint.to_string() != USDC_MINT &&
+                        params.pool.keys.base_mint.to_string() != USDC_MINT) {
+                    error!("Quote symbol condition not met");
                     continue;
                 }
             }
@@ -862,7 +873,7 @@ impl Trader {
             if params.pool.open_time.timestamp() > 0 {
                 let elapsed = chrono::Utc::now() - params.pool.timestamp;
                 if elapsed.num_milliseconds() > strategy.max_delay_since_detect as i64 {
-                    debug!("Max delay since open condition not met. {}, {}, {}",
+                    error!("Max delay since open condition not met. {}, {}, {}",
                         params.pool.open_time.timestamp_millis(),
                         elapsed.num_milliseconds(),
                         strategy.max_delay_since_detect,
@@ -880,7 +891,7 @@ impl Trader {
                 strategy.price,
                 strategy.price_range.clone(),
             ) {
-                debug!("Price condition not met");
+                error!("Price condition not met");
                 continue;
             }
 
@@ -891,7 +902,7 @@ impl Trader {
                 Some(strategy.reserves_quote.unwrap_or(0.0)),
                 strategy.reserves_quote_range.clone(),
             ) {
-                debug!("Quote reserves condition not met");
+                error!("Quote reserves condition not met");
                 continue;
             }
 
@@ -901,7 +912,7 @@ impl Trader {
                 Some(strategy.reserves_base.unwrap_or(0.0)),
                 strategy.reserves_base_range.clone(),
             ) {
-                debug!("Base reserves condition not met");
+                error!("Base reserves condition not met");
                 continue;
             }
 
@@ -912,7 +923,7 @@ impl Trader {
                 Some(strategy.total_supply.unwrap_or(0.0)),
                 strategy.total_supply_range.clone(),
             ) {
-                debug!("Total supply condition not met");
+                error!("Base supply condition not met");
                 continue;
             }
 

@@ -136,7 +136,7 @@ pub struct RaydiumDetector {
     rpc_client: Arc<RpcClient>,
     bloxroute_config: BloxrouteConfig,
     cancel_token: CancellationToken,
-    initialized_pools: Arc<DashSet<Pubkey>>, // Initialized mints cache
+    initialized_pools: Arc<DashSet<Pubkey>>, // Pool initialized via initialize2
     tx: Sender<DetectedPool>, // Detected pool channel
 }
 
@@ -144,7 +144,7 @@ impl RaydiumDetector {
     pub async fn new(
         rpc_client: Arc<RpcClient>,
         tx: Sender<DetectedPool>,
-        initialized_pools: Arc<DashSet<Pubkey>>,
+        initialized_cache: Arc<DashSet<Pubkey>>,
         rpc_ws_url: &str,
         bloxroute_config: &BloxrouteConfig,
         cancel_token: CancellationToken,
@@ -163,7 +163,7 @@ impl RaydiumDetector {
             tx,
             rpc_client,
             cancel_token,
-            initialized_pools,
+            initialized_pools: initialized_cache,
             bloxroute_config: bloxroute_config.clone(),
             pubsub_client: pubsub_client_arc,
         }
@@ -760,7 +760,7 @@ async fn try_to_load_initialized_pool(
     // Fetch the transaction using get_transaction with parsed encoding
     let config = RpcTransactionConfig {
         encoding: Some(UiTransactionEncoding::Base64),
-        commitment: Some(CommitmentConfig::confirmed()),
+        commitment: Some(CommitmentConfig::finalized()),
         max_supported_transaction_version: Some(0),
     };
     let transaction = match rpc_client.get_transaction_with_config(&signature, config).await {
