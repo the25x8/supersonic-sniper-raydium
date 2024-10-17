@@ -69,22 +69,24 @@ pub struct Pool {
     pub initial_price: f64, // Initial price of the base token in quote token
     pub in_whitelist: bool, // If base or quote token is in the watchlist
 
-    // Base token data
+    // Reserves data
     pub base_decimals: u8,
     pub base_reserves: f64,
-    pub base_supply: u64,
-
-    // Base token metadata from MPL Token Metadata program
-    pub base_name: String,
-    pub base_symbol: String,
-    pub base_uri: String,
-    pub base_freezable: bool,
-    pub base_mint_renounced: bool,
-    pub base_meta_mutable: bool,
-    pub base_mint_authority: Pubkey,
 
     pub quote_decimals: u8,
     pub quote_reserves: f64,
+
+    // Base token metadata from mint and MPL Token Metadata program
+    pub token_supply: u64,
+    pub token_name: String,
+    pub token_symbol: String,
+    pub token_uri: String,
+    pub token_freezable: bool,
+    pub token_mint_renounced: bool,
+    pub token_meta_mutable: bool,
+    pub token_mint_authority: Pubkey,
+
+    pub lp_amount: u64,
 
     pub open_time: DateTime<chrono::Utc>, // Pool open time
     pub timestamp: DateTime<chrono::Utc>, // Timestamp when the pool was detected
@@ -182,20 +184,20 @@ pub async fn run(
                 // Adjust quote and base token mints if base mint is WSOL or USDC
                 // to prevent fetching base and metadata data for these mints.
                 // Get real base mint.
-                let base_mint = {
+                let token_mint = {
                     // If base mint is WSOL or USDC, the real base mint is quote mint.
                     if pool.keys.base_mint == spl_token::native_mint::id() || pool.keys.base_mint.to_string() == USDC_MINT {
-                        pool.keys.quote_mint;
+                        pool.keys.quote_mint
+                    } else {
+                        // Otherwise, use the base mint.
+                        pool.keys.base_mint
                     }
-
-                    // Otherwise, use the base mint.
-                    pool.keys.base_mint
                 };
 
                 // If watchlist is set, allow only pools with base or quote token in the watchlist
                 if !watchlist.is_empty() {
                     // Skip if the pool is not in the watchlist
-                    if !watchlist.contains(&base_mint) {
+                    if !watchlist.contains(&token_mint) {
                         continue
                     }
 
@@ -232,8 +234,8 @@ pub async fn run(
                                 &pool.keys.quote_vault,
                             ),
                             serum::get_serum_market_state(rpc_client.clone(), &pool.keys.market_id),
-                            get_token_metadata(rpc_client.clone(), &base_mint),
-                            get_token_mint(rpc_client.clone(), &base_mint)
+                            get_token_metadata(rpc_client.clone(), &token_mint),
+                            get_token_mint(rpc_client.clone(), &token_mint),
                         );
 
                         // Update the pool data with the results
@@ -249,10 +251,10 @@ pub async fn run(
                         // Fetch the only token metadata and mint data and update the pool.
                         let (
                             token_metadata_result,
-                            token_mint_result
+                            token_mint_result,
                         ) = tokio::join!(
-                            get_token_metadata(rpc_client.clone(), &base_mint),
-                            get_token_mint(rpc_client.clone(), &base_mint)
+                            get_token_metadata(rpc_client.clone(), &token_mint),
+                            get_token_mint(rpc_client.clone(), &token_mint),
                         );
 
                         // Update the pool data with the results
@@ -263,15 +265,20 @@ pub async fn run(
                             Some(token_mint_result),
                             Some(token_metadata_result),
                         );
-
-                        // Set quote token decimals to WSOL decimals.
-                        // TODO Check is quote WSOL or USDC and set decimals accordingly
-                        pool.quote_decimals = spl_token::native_mint::DECIMALS;
+                        
+                        // If WSOL or USDC is the base token, set base decimals
+                        if pool.keys.base_mint == spl_token::native_mint::id() ||
+                            pool.keys.base_mint.to_string() == USDC_MINT {
+                            pool.base_decimals = spl_token::native_mint::DECIMALS;
+                        } else {
+                            // Otherwise, WSOL is the quote token
+                            pool.quote_decimals = spl_token::native_mint::DECIMALS;
+                        }
 
                         // Calculate price using the correct reserve amounts
-                        pool.base_reserves /= 10_usize.pow(pool.base_decimals as u32) as f64;
-                        pool.quote_reserves /= 10_usize.pow(pool.quote_decimals as u32) as f64;
-                        pool.initial_price = pool.quote_reserves / pool.base_reserves;
+                        // Assign the reserves to the pool
+                        pool.base_reserves = pool.base_reserves / 10_usize.pow(pool.base_decimals as u32) as f64;
+                        pool.quote_reserves = pool.quote_reserves / 10_usize.pow(pool.quote_decimals as u32) as f64;
 
                         // Calculate the price of base token in terms of quote token
                         pool.initial_price = market::price::adjust_tokens_and_calculate_price(
@@ -284,7 +291,17 @@ pub async fn run(
                         // All other data is already set by the Raydium detector.
                     }
 
-                    error!("BASE SUPPLY: {}", pool.base_supply);
+                    // Calculate actual supply
+                    pool.token_supply = {
+                        // If quote is real quote, divide by 10^base_decimals
+                        if pool.keys.quote_mint == spl_token::native_mint::id() ||
+                            pool.keys.quote_mint.to_string() == USDC_MINT {
+                            pool.token_supply / 10u64.pow(pool.base_decimals as u32)
+                        } else {
+                            // Otherwise, the real base mint is quote mint
+                           pool.token_supply / 10u64.pow(pool.quote_decimals as u32)
+                        }
+                    };
 
                     // Print all the information
                     info!(
@@ -296,8 +313,8 @@ pub async fn run(
                          ⏳ Open Time:          {}\n\
                          ▶️ Mint A:             {}\n\
                          ▶️ Mint B:             {}\n\
-                         ▶️ Reserves A:         {}\n\
-                         ▶️ Reserves B:         {}\n\
+                         ▶️ Reserves A:         {:.10}\n\
+                         ▶️ Reserves B:         {:.10}\n\
                          ▶️ Token Price:        {:.10} WSOL\n\
                          ▶️ Symbol:             {}\n\
                          ▶️ Supply:             {}\n\
@@ -319,13 +336,13 @@ pub async fn run(
                         pool.base_reserves.to_string(),
                         pool.quote_reserves.to_string(),
                         pool.initial_price,
-                        pool.base_symbol,
-                        pool.base_supply,
+                        pool.token_symbol,
+                        pool.token_supply,
                         pool.base_decimals,
-                        pool.base_mint_authority,
-                        if pool.base_mint_renounced { "No" } else { "Yes" },
-                        if pool.base_freezable { "Yes" } else { "No" },
-                        if pool.base_meta_mutable { "Yes" } else { "No" },
+                        pool.token_mint_authority,
+                        if pool.token_mint_renounced { "No" } else { "Yes" },
+                        if pool.token_freezable { "Yes" } else { "No" },
+                        if pool.token_meta_mutable { "Yes" } else { "No" },
                         (chrono::Utc::now().time() - start_time).num_milliseconds()
                     );
 
@@ -343,8 +360,6 @@ pub async fn run(
 
 async fn get_token_mint(client: Arc<RpcClient>, token_mint: &Pubkey) -> Result<Mint, Box<dyn std::error::Error + Send + Sync>> {
     let mut attempts = 0;
-
-    error!("GETTING TOKEN MINT FOR: {}", token_mint);
 
     loop {
         // Get the account data for the token vault mint
@@ -481,12 +496,20 @@ fn update_pool_by_results(
             }
         };
 
-        // Set decimals and supply for the base token
-        pool.base_decimals = base_mint.decimals;
-        pool.base_supply = base_mint.supply;
-        pool.base_freezable = base_mint.freeze_authority != COption::None;
-        pool.base_mint_renounced = base_mint.mint_authority == COption::None;
-        pool.base_mint_authority = base_mint.mint_authority.unwrap_or_default();
+        // Set token decimals. If base mint is WSOL or USDC, set quote decimals,
+        // otherwise set base decimals.
+        if pool.keys.base_mint == spl_token::native_mint::id() ||
+            pool.keys.base_mint.to_string() == USDC_MINT {
+            pool.quote_decimals = base_mint.decimals;
+        } else {
+            pool.base_decimals = base_mint.decimals;
+        };
+
+        // Set token info
+        pool.token_supply = base_mint.supply;
+        pool.token_freezable = base_mint.freeze_authority != COption::None;
+        pool.token_mint_renounced = base_mint.mint_authority == COption::None;
+        pool.token_mint_authority = base_mint.mint_authority.unwrap_or_default();
     }
 
     // Collect the token metadata
@@ -502,15 +525,15 @@ fn update_pool_by_results(
         // Set some metadata fields if available
         if let Some(metadata) = token_metadata {
             // Base token metadata
-            pool.base_name = metadata.name;
-            pool.base_symbol = metadata.symbol;
-            pool.base_uri = metadata.uri;
-            pool.base_meta_mutable = metadata.is_mutable;
+            pool.token_name = metadata.name;
+            pool.token_symbol = metadata.symbol;
+            pool.token_uri = metadata.uri;
+            pool.token_meta_mutable = metadata.is_mutable;
         } else {
-            pool.base_name = "N/A".to_string();
-            pool.base_symbol = "N/A".to_string();
-            pool.base_uri = "N/A".to_string();
-            pool.base_meta_mutable = false;
+            pool.token_name = "N/A".to_string();
+            pool.token_symbol = "N/A".to_string();
+            pool.token_uri = "N/A".to_string();
+            pool.token_meta_mutable = false;
         }
     }
 }

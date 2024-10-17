@@ -80,8 +80,8 @@ fn format_pending_order_row(order: &Order) -> String {
         order.pool_keys.id.to_string(),
         order.direction,
         order.kind,
-        order.amount,
-        order.limit_amount,
+        spl_token::amount_to_ui_amount(order.amount, order.in_decimals),
+        spl_token::amount_to_ui_amount(order.limit_amount, order.out_decimals),
         created_at,
         execution_time,
     )

@@ -5,7 +5,7 @@ use solana_account_decoder::{UiAccountData, UiAccountEncoding};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::commitment_config::CommitmentConfig;
 use tokio::sync::mpsc::{Receiver, Sender};
-use log::{error, info};
+use log::{debug, error, info};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,13 +123,13 @@ impl MarketMonitor {
     /// Run the watchlist add loop to add pools to the watchlist,
     /// it also fetches the initial price of the pool and emits it to the market_tx channel.
     async fn watchlist_add_loop(
-        mut watchlist_update_rx: Receiver<(Pubkey, PoolKeys)>,
+        mut watchlist_add_tx: Receiver<(Pubkey, PoolKeys)>,
         watchlist: Arc<DashMap<Pubkey, PoolKeys>>,
         market_tx: Sender<MarketData>,
         rpc_client: Arc<RpcClient>,
     ) {
-        while let Some((pubkey, pool_keys)) = watchlist_update_rx.recv().await {
-            // Add the pool to the watchlist if it doesn't exist
+        while let Some((pubkey, pool_keys)) = watchlist_add_tx.recv().await {
+            // // Add the pool to the watchlist if it doesn't exist
             let exists = watchlist.contains_key(&pubkey);
             if !exists {
                 watchlist.insert(pubkey, pool_keys);
@@ -141,59 +141,57 @@ impl MarketMonitor {
             }
 
             // Get liquidity state for the pool
-            let state = match raydium::get_amm_liquidity_state(rpc_client.clone(), &pubkey).await {
-                Ok(state) => state,
-                Err(e) => {
-                    error!("Failed to fetch AMM liquidity state: {}", e);
-                    continue;
-                }
-            };
-
-            // Fetch the initial price of the pool and emit to the market_tx channel
-            let (base_reserves, quote_reserves) = match raydium::get_amm_pool_reserves(
-                rpc_client.clone(),
-                &state.coin_vault,
-                &state.pc_vault,
-            ).await {
-                Ok(reserves) => (reserves[0].clone(), reserves[1].clone()),
-                Err(e) => {
-                    error!("Failed to fetch initial AMM pool reserves: {}", e);
-                    continue;
-                }
-            };
-
-            // Calculate the initial price of the pool
-            let price = match market::price::convert_reserves_to_price(
-                state.coin_vault_mint,
-                state.pc_vault_mint,
-                &base_reserves,
-                &quote_reserves,
-            ) {
-                Ok(price) => price,
-                Err(e) => {
-                    error!("Failed to calculate initial token price: {}", e);
-                    continue;
-                }
-            };
-
-            // Emit the initial market data to the market_tx channel
-            let base_reserves_amount = token_amount_to_float(&base_reserves.amount, base_reserves.decimals);
-            let quote_reserves_amount = token_amount_to_float(&quote_reserves.amount, quote_reserves.decimals);
-            match market_tx.send(MarketData {
-                price,
-                pool: pubkey,
-                base_reserves: base_reserves_amount,
-                quote_reserves: quote_reserves_amount,
-                timestamp: std::time::Instant::now(),
-            }).await {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("Failed to send initial market data: {}", e);
-                    continue;
-                }
-            }
-
-            continue; // Skip the rest of the loop
+            // let state = match raydium::get_amm_liquidity_state(rpc_client.clone(), &pubkey).await {
+            //     Ok(state) => state,
+            //     Err(e) => {
+            //         error!("Failed to fetch AMM liquidity state: {}", e);
+            //         continue;
+            //     }
+            // };
+            // 
+            // // Fetch the initial price of the pool and emit to the market_tx channel
+            // let (base_reserves, quote_reserves) = match raydium::get_amm_pool_reserves(
+            //     rpc_client.clone(),
+            //     &state.coin_vault,
+            //     &state.pc_vault,
+            // ).await {
+            //     Ok(reserves) => (reserves[0].clone(), reserves[1].clone()),
+            //     Err(e) => {
+            //         error!("Failed to fetch initial AMM pool reserves: {}", e);
+            //         continue;
+            //     }
+            // };
+            // 
+            // // Calculate the initial price of the pool
+            // let price = match market::price::convert_reserves_to_price(
+            //     state.coin_vault_mint,
+            //     state.pc_vault_mint,
+            //     &base_reserves,
+            //     &quote_reserves,
+            // ) {
+            //     Ok(price) => price,
+            //     Err(e) => {
+            //         error!("Failed to calculate initial token price: {}", e);
+            //         continue;
+            //     }
+            // };
+            // 
+            // // Emit the initial market data to the market_tx channel
+            // let base_reserves_amount = token_amount_to_float(&base_reserves.amount, base_reserves.decimals);
+            // let quote_reserves_amount = token_amount_to_float(&quote_reserves.amount, quote_reserves.decimals);
+            // match market_tx.send(MarketData {
+            //     price,
+            //     pool: pubkey,
+            //     base_reserves: base_reserves_amount,
+            //     quote_reserves: quote_reserves_amount,
+            //     timestamp: std::time::Instant::now(),
+            // }).await {
+            //     Ok(_) => (),
+            //     Err(e) => {
+            //         error!("Failed to send initial market data: {}", e);
+            //         continue;
+            //     }
+            // }
         }
     }
 
@@ -430,7 +428,7 @@ impl MarketMonitor {
                         }
                     };
 
-                    info!(
+                    debug!(
                         "Market data updated for pool {}\n\
                         Base reserves: {}\n\
                         Quote reserves: {}\n\

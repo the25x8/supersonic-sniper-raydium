@@ -1,10 +1,14 @@
+use std::error::Error;
 use std::sync::Arc;
 use borsh::BorshDeserialize;
 use serde::{Deserialize, Serialize};
-use log::error;
+use log::{error, info};
 use solana_account_decoder::parse_token::UiTokenAmount;
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_program::program_pack::Pack;
 use solana_program::pubkey::Pubkey;
+use spl_token::state::Mint;
+use crate::detector::PoolKeys;
 use crate::error::handle_attempt;
 
 const MAX_FETCH_RETRIES: u32 = 3;
@@ -171,13 +175,21 @@ pub struct LiquidityStateV4 {
 //     };
 // }
 
-pub async fn get_amm_liquidity_state(rpc_client: Arc<RpcClient>, amm_id: &Pubkey) -> Result<LiquidityStateV4, Box<dyn std::error::Error>> {
+#[derive(Debug)]
+pub struct LiquidityCheckResult {
+    pub is_locked: bool,
+    pub burnt: f64,
+    pub pool_address: Pubkey,
+    pub address: Pubkey,
+}
+
+pub async fn get_amm_liquidity_state(rpc_client: Arc<RpcClient>, amm_id: &Pubkey) -> Result<LiquidityStateV4, Box<dyn std::error::Error + Send + Sync>> {
     let mut attempts = 0;
 
     loop {
         // Get program account data for the Raydium AMM account
         let data = match rpc_client.get_account_data(amm_id).await {
-            Ok(account) => account,
+            Ok(data) => data,
             Err(e) => {
                 error!("Failed to get amm account: {}", e);
 
@@ -190,8 +202,8 @@ pub async fn get_amm_liquidity_state(rpc_client: Arc<RpcClient>, amm_id: &Pubkey
         };
 
         // Deserialize the serum market data
-        match LiquidityStateV4::try_from_slice(&data) {
-            Ok(amm_data) => amm_data,
+        return match LiquidityStateV4::try_from_slice(&data) {
+            Ok(amm_data) => Ok(amm_data),
             Err(e) => {
                 error!("Failed to unpack amm data: {}", e);
                 return Err(Box::new(e));
@@ -229,3 +241,66 @@ pub async fn get_amm_pool_reserves(
     }
 }
 
+/// Check if liquidity is locked for a given AMM pool. Liquidity is considered
+/// locked if the percentage of burnt LP tokens is greater than 95%.
+/// If lp_amount isn't provided, the function will fetch liquidity pool data.
+pub async fn check_liquidity(
+    pool_keys: &PoolKeys,
+    mut lp_reserve: f64,
+    rpc_client: Arc<RpcClient>,
+) -> Result<LiquidityCheckResult, Box<dyn Error + Send + Sync>> {
+    // Get lp_mint and lp_reserve from liquidity_state
+    let lp_mint = pool_keys.lp_mint;
+
+    // Fetch mint account info for lp_mint
+    let mint_account_info = rpc_client.get_account(&lp_mint).await?;
+    let mint_data = mint_account_info.data;
+
+    // Parse the mint account data
+    let mint_info = Mint::unpack(&mint_data)?;
+
+    // Get decimals and supply
+    let decimals = mint_info.decimals;
+    let supply = mint_info.supply;
+
+    // Calculate lp_reserve / 10^decimals
+    lp_reserve = lp_reserve / 10u64.pow(decimals as u32) as f64;
+
+    // Calculate actualSupply
+    let actual_supply = supply as f64 / 10u64.pow(decimals as u32) as f64;
+
+    // Calculate maxLpSupply
+    let max_lp_supply = actual_supply.max(lp_reserve - 1.0);
+
+    // Calculate burnAmt
+    let burn_amt = lp_reserve - actual_supply;
+
+    // Calculate burnPct
+    let burn_pct = (burn_amt / lp_reserve) * 100.0;
+
+    // Determine if liquidity is locked
+    let is_liquidity_locked = burn_pct > 95.0;
+
+    // Print all the values in one info!
+    info!(
+        "Liquidity Check:\n\
+        is_liquidity_locked: {}\n\
+        burn_pct: {:.2}%\n\
+        pool_address: {}\n\
+        token_address: {}",
+        is_liquidity_locked,
+        burn_pct,
+        pool_keys.id,
+        lp_mint,
+    );
+
+    // Build the result
+    let result = LiquidityCheckResult {
+        is_locked: is_liquidity_locked,
+        burnt: burn_pct,
+        pool_address: pool_keys.id,
+        address: lp_mint,
+    };
+
+    Ok(result)
+}

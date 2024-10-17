@@ -2,9 +2,9 @@ pub mod detector;
 mod instructions;
 mod liquidity;
 
-pub use instructions::{build_swap_in_instruction, build_swap_out_instruction};
+pub use instructions::{build_swap_in_instruction};
 pub use liquidity::{
-    get_amm_liquidity_state,
+    check_liquidity,
     get_amm_pool_reserves,
     LiquidityStateV4,
 };

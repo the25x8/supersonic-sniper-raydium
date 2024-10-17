@@ -11,6 +11,7 @@ pub struct AppConfig {
     pub wallet: WalletConfig,
     pub detector: DetectorConfig,
     pub trader: TraderConfig,
+    pub executor: ExecutorConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -198,6 +199,12 @@ impl ExecutorType {
             _ => None
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ExecutorConfig {
+    pub compute_unit_limit: u32,
+    pub compute_unit_price: u64,
 }
 
 /// Loads the application configuration from a specified file and overlays it with environment variables.

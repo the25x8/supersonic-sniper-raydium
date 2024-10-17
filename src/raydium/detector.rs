@@ -463,16 +463,17 @@ impl RaydiumDetector {
                         pool_type: PoolType::RaydiumAmm,
                         base_decimals: state.coin_decimals as u8,
                         base_reserves: 0.0, // Not available yet
-                        base_supply: 0, // Not available yet
-                        base_name: "".to_string(),
-                        base_symbol: "".to_string(),
-                        base_uri: "".to_string(),
-                        base_freezable: false,
-                        base_mint_renounced: false,
-                        base_meta_mutable: false,
-                        base_mint_authority: Default::default(),
+                        token_supply: 0, // Not available yet
+                        token_name: "".to_string(),
+                        token_symbol: "".to_string(),
+                        token_uri: "".to_string(),
+                        token_freezable: false,
+                        token_mint_renounced: false,
+                        token_meta_mutable: false,
+                        token_mint_authority: Default::default(),
                         quote_decimals: state.pc_decimals as u8,
                         quote_reserves: 0.0, // Not available yet
+                        lp_amount: state.lp_amount,
                         open_time: pool_open_time,
                         timestamp: Utc::now(),
                     };
@@ -650,16 +651,17 @@ impl RaydiumDetector {
                                             pool_type: PoolType::RaydiumAmm,
                                             base_decimals: 0, // Not available yet
                                             base_reserves: pool.token1_reserves.parse().unwrap_or(0.0),
-                                            base_supply: 0, // Not available yet
-                                            base_name: "".to_string(),
-                                            base_symbol: "".to_string(),
-                                            base_uri: "".to_string(),
-                                            base_freezable: false,
-                                            base_mint_renounced: false,
-                                            base_meta_mutable: false,
-                                            base_mint_authority: Default::default(),
+                                            token_supply: 0, // Not available yet
+                                            token_name: "".to_string(),
+                                            token_symbol: "".to_string(),
+                                            token_uri: "".to_string(),
+                                            token_freezable: false,
+                                            token_mint_renounced: false,
+                                            token_meta_mutable: false,
+                                            token_mint_authority: Default::default(),
                                             quote_decimals: 0, // Not available yet
                                             quote_reserves: pool.token2_reserves.parse().unwrap_or(0.0),
+                                            lp_amount: 0, // Not available yet
                                             open_time: Utc.timestamp_opt(pool.open_time.parse().unwrap_or(0), 0).unwrap(),
                                             timestamp: Utc::now(),
                                             initial_price: 0.0,
@@ -758,7 +760,7 @@ async fn try_to_load_initialized_pool(
     // Fetch the transaction using get_transaction with parsed encoding
     let config = RpcTransactionConfig {
         encoding: Some(UiTransactionEncoding::Base64),
-        commitment: Some(CommitmentConfig::finalized()),
+        commitment: Some(CommitmentConfig::confirmed()),
         max_supported_transaction_version: Some(0),
     };
     let transaction = match rpc_client.get_transaction_with_config(&signature, config).await {
@@ -815,8 +817,12 @@ async fn try_to_load_initialized_pool(
                         // Check if this is the initialize2 instruction
                         if is_initialize2_instruction(instruction_data) {
                             let pool_account_index = ix.accounts[4] as usize;
-                            let pool_pubkey = account_keys.get(pool_account_index).unwrap();
-                            return Ok(Some(*pool_pubkey));
+                            if let Some(pool_pubkey) = account_keys.get(pool_account_index) {
+                                return Ok(Some(*pool_pubkey));
+                            } else {
+                                error!("Failed to get pool pubkey from instruction");
+                                return Err("Failed to get pool pubkey from instruction".into());
+                            }
                         }
                     }
 

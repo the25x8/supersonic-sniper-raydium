@@ -4,6 +4,7 @@ use dashmap::DashMap;
 use log::info;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use crate::executor::order::OrderKind;
 use crate::trader;
 use crate::trader::trade::Trade;
 
@@ -43,10 +44,26 @@ fn format_trade_row(trade: &Trade) -> String {
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
 
+    let trade_status = {
+        // If trade is completed, return the order kind of the completed sell order.
+        if trade.is_completed() {
+            match trade.get_completed_sell_order().unwrap().kind {
+                OrderKind::StopLoss => "Stop loss",
+                OrderKind::TakeProfit => "Take profit",
+                OrderKind::HoldTime => "Hold time",
+                _ => "Unknown",
+            }
+        } else if trade.error.is_some() {
+            "Error"
+        } else {
+            "Pending"
+        }
+    };
+
     format!(
         "{:<46} | {:<10} | {:<12.9} | {:<12.9} | {:<12.9} | {:<12.2} | {:<14.9} | {:<19}",
         trade.pool_keys.id.to_string(),
-        trade.get_completed_sell_order().unwrap().kind,
+        trade_status,
         trade.quote_in_amount,
         trade.buy_price,
         trade.sell_price,

@@ -27,19 +27,25 @@ pub struct Order {
     pub out_decimals: u8,
 
     // Swap fields are the same for swapIn and swapOut orders
-    pub amount: f64,
-    pub limit_amount: f64, // Can be min or max amount depending on the order type
+    pub amount: u64,
+    pub limit_amount: u64, // Can be min or max amount depending on the order type
 
     // Execution details
     pub executor: ExecutorType,
-    pub executor_bribe: Option<f64>, // Amount paid to the executor for the order
+    pub executor_bribe: u64, // Amount paid to the executor for the order
 
     // Blockchain tx details and timestamps
     pub tx_id: Option<String>,
-    pub feed_lamports: Option<u64>,
+    pub fee: u64,
+    pub compute_units_consumed: u64,
+
+    // Confirmed balance difference on the out account after the order is executed.
+    pub balance_change: u64,
+
+    // Timestamps
+    pub created_at: u64,
     pub confirmed_at: u64,
     pub cancelled_at: u64,
-    pub created_at: u64,
     pub delayed_at: u64, // Timestamp when the order is delayed
 }
 
@@ -49,14 +55,14 @@ impl Order {
         trade_id: Uuid,
         kind: OrderKind,
         pool_keys: &PoolKeys,
-        amount_in: f64,
-        min_amount_out: f64,
+        amount: u64,
+        limit_amount: u64,
         in_mint: &Pubkey,
         out_mint: &Pubkey,
         in_decimals: u8,
         out_decimals: u8,
         executor: ExecutorType,
-        bribe: Option<f64>,
+        bribe: u64,
         delay: u64,
     ) -> Self {
         // Delayed at timestamp is current timestamp + delay if delay is greater than 0.
@@ -75,8 +81,9 @@ impl Order {
             trade_id,
             delayed_at,
             executor,
-            amount: amount_in,
-            limit_amount: min_amount_out,
+            amount,
+            limit_amount,
+            fee: 0,
             tx_id: None,
             confirmed_at: 0,
             cancelled_at: 0,
@@ -86,10 +93,34 @@ impl Order {
             pool_keys: pool_keys.clone(),
             created_at: current_timestamp(),
             executor_bribe: bribe,
-            feed_lamports: None,
+            balance_change: 0,
+            compute_units_consumed: 0,
         }
     }
 
+    /// Adds the blockchain transaction details to the order.
+    pub fn confirm(
+        &mut self,
+        tx_id: &str,
+        balance_change: u64,
+        fee: u64,
+        units_consumed: u64,
+        timestamp: u64,
+    ) {
+        self.tx_id = Some(tx_id.to_string());
+        self.status = OrderStatus::Completed;
+        self.balance_change = balance_change; // Balance change after the order is executed
+        self.compute_units_consumed = units_consumed;
+        self.fee = fee; // Fee paid for the transaction
+        self.confirmed_at = timestamp;
+    }
+
+    pub fn cancel(&mut self, timestamp: u64) {
+        self.status = OrderStatus::Cancelled;
+        self.cancelled_at = timestamp;
+    }
+
+    /// Updates the order status and does the necessary timestamp updates.
     pub fn update_status(&mut self, status: OrderStatus) {
         self.status = status;
         match status {
@@ -122,24 +153,15 @@ impl fmt::Display for OrderKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OrderDirection {
-    BaseIn,
-    BaseOut,
-}
-
-impl OrderDirection {
-    pub fn value(&self) -> String {
-        match *self {
-            OrderDirection::BaseIn => "base_in".to_string(),
-            OrderDirection::BaseOut => "base_out".to_string(),
-        }
-    }
+    QuoteIn,
+    QuoteOut,
 }
 
 impl fmt::Display for OrderDirection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            OrderDirection::BaseIn => write!(f, "BaseIn"),
-            OrderDirection::BaseOut => write!(f, "BaseOut"),
+            OrderDirection::QuoteIn => write!(f, "Quote In"),
+            OrderDirection::QuoteOut => write!(f, "Quote Out"),
         }
     }
 }

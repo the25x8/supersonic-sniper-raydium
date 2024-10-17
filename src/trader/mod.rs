@@ -10,13 +10,12 @@ use log::{debug, error, info, warn};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use tokio::sync::mpsc::Receiver;
 use tokio_util::sync::CancellationToken;
-use crate::config::{AppConfig, BloxrouteConfig, ExecutorType, StrategyConfig};
+use crate::config::{AppConfig, BloxrouteConfig, ExecutorConfig, ExecutorType, StrategyConfig};
 use crate::detector::{Pool};
 use crate::solana::quote_mint::USDC_MINT;
 use crate::executor::Executor;
 use crate::executor::order::{Order, OrderDirection, OrderKind, OrderStatus};
-use crate::market;
-use crate::raydium::{get_amm_pool_reserves};
+use crate::{solana};
 use crate::market::monitor::{MarketData, MarketMonitor};
 use crate::trader::backup::Backup;
 use crate::trader::trade::{Trade, TradeExchange};
@@ -79,7 +78,7 @@ impl Trader {
         });
 
         // Initialize the market monitor module
-        let (market_tx, market_rx) = tokio::sync::mpsc::channel(10);
+        let (market_tx, market_rx) = tokio::sync::mpsc::channel(100);
         let market_monitor = Arc::new(MarketMonitor::new(
             client.clone(),
             ws_url,
@@ -94,6 +93,7 @@ impl Trader {
             active_trades.clone(),
             market_monitor.clone(),
             backup.clone(),
+            &config.executor,
             &config.bloxroute,
             cancel_token.clone(),
         ).await;
@@ -149,15 +149,19 @@ impl Trader {
         active_trades: Arc<DashMap<Pubkey, Vec<Trade>>>,
         market_monitor: Arc<MarketMonitor>,
         backup: Arc<Backup>,
+        executor_config: &ExecutorConfig,
         bloxroute_config: &BloxrouteConfig,
         cancel_token: CancellationToken,
     ) -> Arc<Executor> {
         // Initialize the executor module and get the arc reference
-        let (executed_orders_tx, mut executed_orders_rx) = tokio::sync::mpsc::channel(10);
+        let (executed_orders_tx, mut executed_orders_rx) = tokio::sync::mpsc::channel(30);
+        let (failed_orders_tx, mut failed_orders_rx) = tokio::sync::mpsc::channel(30);
         let executor = Arc::new(Executor::new(
             client.clone(),
             wallet.clone(),
             executed_orders_tx,
+            failed_orders_tx,
+            executor_config,
             bloxroute_config,
             cancel_token,
         ).await);
@@ -165,23 +169,69 @@ impl Trader {
         // Create a task to listen for executed orders and process them.
         // Only confirmed orders will be sent to the executor.
         let executor_clone = executor.clone();
+        let backup_clone = backup.clone();
+        let active_trades_clone = active_trades.clone();
+        let market_monitor_clone = market_monitor.clone();
         tokio::spawn(async move {
             while let Some(order) = executed_orders_rx.recv().await {
-                let active_trades = active_trades.clone();
-                let backup = backup.clone();
-                let rpc_client = client.clone();
+                let active_trades = active_trades_clone.clone();
+                let backup_clone = backup_clone.clone();
                 let executor_clone = executor_clone.clone();
-                let market_monitor = market_monitor.clone();
+                let market_monitor = market_monitor_clone.clone();
                 tokio::spawn(async move {
                     Self::process_order(
                         order,
-                        executor_clone.clone(),
-                        active_trades.clone(),
-                        market_monitor.clone(),
-                        rpc_client.clone(),
-                        backup.clone(),
+                        executor_clone,
+                        active_trades,
+                        market_monitor,
+                        backup_clone,
                     ).await;
                 });
+            }
+        });
+
+        // Create a task to listen for failed orders and process them.
+        tokio::spawn(async move {
+            while let Some((order, error)) = failed_orders_rx.recv().await {
+                // We need to update the trade status and remove it from the active trades.
+                // Track the error and log it for debugging purposes.
+
+                // Get the trade ID from the order
+                let trade_id = order.trade_id;
+                let pool_pubkey = order.pool_keys.id;
+
+                // Acquire the lock to update the trade related to the failed order
+                let mut trade_copy: Option<Trade> = None;
+                if let Some(mut trades_ref) = active_trades.get_mut(&pool_pubkey) {
+                    if let Some(trade_in_map) = trades_ref
+                        .value_mut()
+                        .iter_mut()
+                        .find(|t| t.id == trade_id)
+                    {
+                        // Update the trade status
+                        trade_in_map.fail(&error);
+                        trade_copy = Some(trade_in_map.clone()); // Clone the trade for history
+
+                        // Remove the trade from the trades_ref
+                        trades_ref.value_mut().retain(|t| t.id != trade_id);
+
+                        // Check if the trades_ref is empty
+                        let is_empty = trades_ref.value().is_empty();
+                        drop(trades_ref);
+
+                        // If the trades_ref is empty, remove the pool from the active trades
+                        if is_empty {
+                            active_trades.remove(&pool_pubkey);
+                        }
+                    }
+                    // trades_ref mutable reference is dropped here
+                }
+
+                // If the trade was updated as failed, save it to the history
+                if trade_copy.is_some() {
+                    market_monitor.remove_from_watchlist(&pool_pubkey).await;
+                    backup.save_trade_in_history(trade_copy.unwrap()).await;
+                }
             }
         });
 
@@ -209,17 +259,6 @@ impl Trader {
                 // Process the trades for the current market
                 if let Some(trades_list) = active_trades.get(&market_data.pool) {
                     for trade in trades_list.iter() {
-                        debug!(
-                            "\n\
-                            🔔 Market Data Received for Trade!\n\
-                            ────────────────────────────────\n\
-                            📊 Trade ID:        {}\n\
-                            💰 Current Price:   {:.10}\n\
-                            ────────────────────────────────\n",
-                            trade.id,
-                            market_data.price,
-                        );
-
                         // Skip trade if completed
                         if trade.is_completed() {
                             continue;
@@ -354,7 +393,7 @@ impl Trader {
         });
     }
 
-    /// Processes the executed order and updates the trade status accordingly.
+    /// Processes the completed order and updates the trade status accordingly.
     /// It implements the hook logic and executes the post-swap actions like
     /// scheduling take profit, stop loss, and hold time orders.
     /// If it is a sell order, it also cancels uncompleted orders if the trade is completed.
@@ -364,9 +403,18 @@ impl Trader {
         executor: Arc<Executor>,
         trades: Arc<DashMap<Pubkey, Vec<Trade>>>,
         market_monitor: Arc<MarketMonitor>,
-        rpc_client: Arc<RpcClient>,
         backup: Arc<Backup>,
     ) {
+        // Check is the order is completed
+        if order.status != OrderStatus::Completed {
+            error!("Received order is not completed");
+            return;
+        }
+        if order.tx_id.is_none() {
+            error!("Transaction ID is missing for the order");
+            return;
+        }
+
         let trade_id = order.trade_id;
         let pool_pubkey = order.pool_keys.id;
         let trade_option = {
@@ -391,59 +439,28 @@ impl Trader {
 
         // Perform asynchronous operations without holding any locks
 
-        // 1. Get current price
-        let current_price = match get_amm_pool_reserves(
-            rpc_client.clone(),
-            &trade.pool_keys.base_vault,
-            &trade.pool_keys.quote_vault,
-        ).await {
-            Ok(reserves) => {
-                match market::price::convert_reserves_to_price(
-                    trade.pool_keys.base_mint,
-                    trade.pool_keys.quote_mint,
-                    &reserves[0],
-                    &reserves[1],
-                ) {
-                    Ok(price) => price,
-                    Err(e) => {
-                        error!("Failed to get current price: {}", e);
-                        return;
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to get current price: {}", e);
-                return;
-            }
-        };
-
-        // 2. Estimate the amount out based on the current price and amount in
-        // TODO - This is a simple estimation, we need to improve this by
-        //  fetching the actual amount from spl-token accounts of the wallet.
-        let estimated_amount_out = match order.direction {
-            OrderDirection::BaseIn => order.amount / current_price,
-            OrderDirection::BaseOut => order.amount * current_price,
-        };
-
-        // 3. Handle the order based on the direction
+        // Handle the order based on the direction
         match order.direction {
-            // Process buy order
-            OrderDirection::BaseIn => {
-                // Check that order tx_id is not None
-                if order.tx_id.is_none() {
-                    warn!("Received buy order without tx_id");
-                    return;
-                }
+            // In case of buy order create sell orders and schedule them.
+            OrderDirection::QuoteIn => {
+                // The min amount out is the amount of tokens that should be received after selling.
+                // Zero if the sell slippage is not set.
+                let min_amount_out = {
+                    if trade.strategy.sell_slippage > 0.0 {
+                        let balance_change = spl_token::amount_to_ui_amount(
+                            order.balance_change,
+                            order.in_decimals,
+                        );
+                        balance_change - (balance_change * (trade.strategy.sell_slippage / 100.0))
+                    } else {
+                        0.0
+                    }
+                };
 
                 // Re-acquire the lock to update the trade with buy details
                 if let Some(mut trades_ref) = trades.get_mut(&pool_pubkey) {
                     if let Some(trade_in_map) = trades_ref.value_mut().iter_mut().find(|t| t.id == trade.id) {
-                        trade_in_map.buy(
-                            order.amount,
-                            estimated_amount_out,
-                            order.tx_id.unwrap(),
-                            current_timestamp(),
-                        );
+                        trade_in_map.buy(&order); // Pass the confirmed order to the trade
                     }
                     // trades_ref mutable reference is dropped here
                 }
@@ -460,59 +477,73 @@ impl Trader {
                             }
                         };
 
+                        // Define mint and decimals of the sell order,
+                        // based on the buy order's in and out mints.
+                        let sell_in_mint = order.out_mint; // Buy order's out mint is the in mint for the sell order
+                        let sell_out_mint = order.in_mint; // Buy order's in mint is the out mint for the sell order
+                        let sell_in_decimals = order.out_decimals;
+                        let sell_out_decimals = order.in_decimals;
+
+                        // Convert the min amount to the raw amount
+                        let min_amount_out = spl_token::ui_amount_to_amount(min_amount_out, sell_out_decimals);
+                        let bloxroute_bribe = spl_token::ui_amount_to_amount(
+                            trade.strategy.sell_bribe.unwrap_or(0.0),
+                            sell_out_decimals,
+                        );
+
                         // Determine the possible sell orders based on the strategy.
                         let possible_sell_orders = vec![
                             (
                                 trade.strategy.hold_time > 0,
                                 Order::new(
-                                    OrderDirection::BaseOut,
+                                    OrderDirection::QuoteOut,
                                     trade.id,
                                     OrderKind::HoldTime,
                                     &trade.pool_keys,
-                                    estimated_amount_out,
-                                    estimated_amount_out - (estimated_amount_out * (trade.strategy.sell_slippage / 100.0)),
-                                    &trade.pool_keys.base_mint,
-                                    &trade.pool_keys.quote_mint,
-                                    trade.base_decimals,
-                                    trade.quote_decimals,
+                                    order.balance_change, // amount of received tokens
+                                    min_amount_out,
+                                    &sell_in_mint,
+                                    &sell_out_mint,
+                                    sell_in_decimals,
+                                    sell_out_decimals,
                                     ExecutorType::RPC, // Hold time order is always executed by RPC
-                                    trade.strategy.buy_bribe,
+                                    0, // RPC doesn't require a bribe
                                     trade.strategy.hold_time,
                                 ),
                             ),
                             (
                                 trade.strategy.take_profit > 0.0,
                                 Order::new(
-                                    OrderDirection::BaseOut,
+                                    OrderDirection::QuoteOut,
                                     trade.id,
                                     OrderKind::TakeProfit,
                                     &trade.pool_keys,
-                                    estimated_amount_out,
-                                    estimated_amount_out - (estimated_amount_out * (trade.strategy.sell_slippage / 100.0)),
-                                    &trade.pool_keys.base_mint,
-                                    &trade.pool_keys.quote_mint,
-                                    trade.base_decimals,
-                                    trade.quote_decimals,
+                                    order.balance_change, // amount of received tokens
+                                    min_amount_out,
+                                    &sell_in_mint,
+                                    &sell_out_mint,
+                                    sell_in_decimals,
+                                    sell_out_decimals,
                                     trade.strategy.take_profit_executor,
-                                    trade.strategy.sell_bribe,
+                                    bloxroute_bribe,
                                     trade.strategy.sell_delay,
                                 ),
                             ),
                             (
                                 trade.strategy.stop_loss > 0.0,
                                 Order::new(
-                                    OrderDirection::BaseOut,
+                                    OrderDirection::QuoteOut,
                                     trade.id,
                                     OrderKind::StopLoss,
                                     &trade.pool_keys,
-                                    estimated_amount_out,
-                                    estimated_amount_out - (estimated_amount_out * (trade.strategy.sell_slippage / 100.0)),
-                                    &trade.pool_keys.base_mint,
-                                    &trade.pool_keys.quote_mint,
-                                    trade.base_decimals,
-                                    trade.quote_decimals,
+                                    order.balance_change, // amount of received tokens
+                                    min_amount_out,
+                                    &sell_in_mint,
+                                    &sell_out_mint,
+                                    sell_in_decimals,
+                                    sell_out_decimals,
                                     stop_loss_executor,
-                                    trade.strategy.sell_bribe,
+                                    bloxroute_bribe,
                                     trade.strategy.sell_delay,
                                 ),
                             )
@@ -553,89 +584,91 @@ impl Trader {
             }
 
             // Process sell order
-            OrderDirection::BaseOut => {
-                let mut is_completed = false;
-                let mut trade_copy: Option<Trade> = None;
-
-                // Confirm that the order tx_id is not None
-                if order.tx_id.is_none() {
-                    warn!("Received sell order without tx_id");
-                    return;
-                }
-
+            OrderDirection::QuoteOut => {
                 // Re-acquire the lock to update the trade
                 if let Some(mut trades_ref) = trades.get_mut(&pool_pubkey) {
                     if let Some(trade_in_map) = trades_ref.value_mut().iter_mut().find(|t| t.id == trade.id) {
-                        // Confirm the sell order
-                        if let Err(e) = trade_in_map.sell(
-                            order.kind,
-                            order.amount,
-                            estimated_amount_out,
-                            order.tx_id.unwrap(),
-                            current_timestamp(),
-                        ) {
+                        // Pass the confirmed sell order to the trade
+                        if let Err(e) = trade_in_map.sell(&order) {
                             error!("Failed to confirm sell order: {}", e);
                             return;
                         }
 
-                        // If the trade is completed, move it to the history and remove from active trades
-                        if trade_in_map.is_completed() {
-                            trade_in_map.archive();
-
-                            // Set these values to perform async operations after dropping the lock
-                            is_completed = true;
-                            trade_copy = Some(trade_in_map.clone());
-
-                            let buy_order = trade_in_map.buy_order.as_ref().unwrap();
-                            let completed_sell_order = trade_in_map.get_completed_sell_order().unwrap();
-                            let completed_in = completed_sell_order.confirmed_at - buy_order.created_at;
-                            info!(
-                                "\n🟢 Trade Completed Successfully!\n\
-                                ───────────────────────────────\n\
-                                👉 Trade ID:        {}\n\
-                                👉 Result:          {}\n\
-                                📊 Pool:            {}\n\
-                                💰 Buy Amount:      {:.10}\n\
-                                💰 Sell Amount:     {:.10}\n\
-                                💰 Profit:          {:.10} (SOL)\n\
-                                💰 Profit %:        {:.2}%\n\
-                                🕒 Hold Time:       {} ms\n\
-                                🤔 Strategy:        {}\n\
-                                🕒 Buy Time:        {}\n\
-                                🕒 Sell Time:       {}\n\
-                                🚀 Completed in:    {} sec.\n",
-                                trade_in_map.id,
-                                completed_sell_order.kind,
-                                trade_in_map.pool_keys.id.to_string(),
-                                trade_in_map.buy_price,
-                                trade_in_map.sell_price,
-                                trade_in_map.profit_amount,
-                                trade_in_map.profit_percent,
-                                trade_in_map.strategy.hold_time,
-                                trade_in_map.strategy_name,
-                                chrono::Utc.timestamp_opt(buy_order.confirmed_at as i64, 0).unwrap().to_rfc3339(),
-                                chrono::Utc.timestamp_opt(completed_sell_order.confirmed_at as i64, 0).unwrap().to_rfc3339(),
-                                completed_in,
-                            );
-
-                            // Remove the trade from the trades_ref
-                            trades_ref.value_mut().retain(|t| t.id != trade_id);
+                        // Return error if order isn't completed
+                        if !trade_in_map.is_completed() {
+                            error!("Sell order isn't completed for trade {}", order.trade_id);
                         }
+
+                        // If the trade is completed, move it to the history and remove from active trades
+                        trade_in_map.archive();
+
+                        // Make a copy of the trade for history
+                        let trade_copy = trade_in_map.clone();
+                        let buy_order = trade_in_map.buy_order.as_ref().unwrap();
+                        let completed_sell_order = trade_in_map.get_completed_sell_order().unwrap();
+                        let completed_in = completed_sell_order.confirmed_at - buy_order.created_at;
+
+                        info!(
+                            "\n🟢 Trade Completed Successfully!\n\
+                             ───────────────────────────────\n\
+                             👉 Trade ID:        {}\n\
+                             👉 Result:          {}\n\
+                             📊 Pool:            {}\n\
+                             💰 Buy Price:       {:.10}\n\
+                             💰 Sell Price:      {:.10}\n\
+                             💰 Profit:          {:.10} (SOL)\n\
+                             💰 Profit %:        {:.2}%\n\
+                             🕒 Hold Time:       {} ms\n\
+                             🤔 Strategy:        {}\n\
+                             🕒 Buy Time:        {}\n\
+                             🕒 Sell Time:       {}\n\
+                             🚀 Completed in:    {} sec.\n",
+                            trade_in_map.id,
+                            completed_sell_order.kind,
+                            trade_in_map.pool_keys.id.to_string(),
+                            trade_in_map.buy_price,
+                            trade_in_map.sell_price,
+                            trade_in_map.profit_amount,
+                            trade_in_map.profit_percent,
+                            trade_in_map.strategy.hold_time,
+                            trade_in_map.strategy_name,
+                            chrono::Utc.timestamp_opt(buy_order.confirmed_at as i64, 0).unwrap().to_rfc3339(),
+                            chrono::Utc.timestamp_opt(completed_sell_order.confirmed_at as i64, 0).unwrap().to_rfc3339(),
+                            completed_in,
+                        );
+
+                        // Remove the trade from the trades_ref
+                        trades_ref.value_mut().retain(|t| t.id != trade_id);
 
                         // Check if the trades_ref is empty
                         let is_empty = trades_ref.value().is_empty();
                         drop(trades_ref); // // Explicitly drop the mutable reference here
 
+                        // All async operations here after lock release
+
+                        // If it was the last trade for the pool, clean active trades
+                        // and remove pool from the watchlist.
                         if is_empty {
                             trades.remove(&pool_pubkey);
+                            market_monitor.remove_from_watchlist(&pool_pubkey).await;
                         }
-                    }
-                }
 
-                // Async operations after dropping the lock
-                if is_completed && trade_copy.is_some() {
-                    market_monitor.remove_from_watchlist(&pool_pubkey).await;
-                    backup.save_trade_in_history(trade_copy.unwrap()).await;
+                        // If it was not a hold time order, call the executor
+                        // to cancel the uncompleted hold time order
+                        if order.kind != OrderKind::HoldTime {
+                            if let Some(order) = trade_copy.hold_time_order.as_ref() {
+                                match executor.cancel_order(order.id).await {
+                                    Ok(_) => (),
+                                    Err(e) => {
+                                        error!("Failed to cancel hold time order: {}", e);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Save trade to history
+                        backup.save_trade_in_history(trade_copy).await;
+                    }
                 }
             }
         }
@@ -652,7 +685,7 @@ impl Trader {
 
         // Check if the pool is already being traded. It can happen when
         // the active trade for this pool was recovered from the backup file.
-        // if active_trades.contains_key(&pool.keys.id) {
+        // if active_trades.contains_key(&keys.id) {
         //     return;
         // }
 
@@ -665,10 +698,10 @@ impl Trader {
                     pool: pool.clone(),
                     base_reserves: pool.base_reserves,
                     quote_reserves: pool.quote_reserves,
-                    freezable: pool.base_freezable,
-                    mint_renounced: pool.base_mint_renounced,
-                    meta_mutable: pool.base_meta_mutable,
-                    base_supply: pool.base_supply,
+                    freezable: pool.token_freezable,
+                    mint_renounced: pool.token_mint_renounced,
+                    meta_mutable: pool.token_meta_mutable,
+                    base_supply: pool.token_supply,
                     price: pool.initial_price,
                 },
             ) {
@@ -770,27 +803,51 @@ impl Trader {
 
         // Prepare the buy order
         let amount_in = trade.strategy.quote_amount;
-        let approx_amount_out = amount_in / current_price;
-        let min_amount_out = approx_amount_out - (approx_amount_out * (trade.strategy.buy_slippage / 100.0));
+
+        // Calculate the min amount out based on the buy slippage.
+        // If the slippage is not set, the min amount out is zero.
+        let min_amount_out = {
+            if trade.strategy.buy_slippage > 0.0 {
+                let approx_amount_out = amount_in / current_price;
+                approx_amount_out - (approx_amount_out * (trade.strategy.buy_slippage / 100.0))
+            } else {
+                0.0
+            }
+        };
+
+        // Determine real quote and base tokens. If the base mint is wrapped SOL or USDC reverse the mints.
+        let (
+            in_mint,
+            out_mint,
+            in_decimals,
+            out_decimals,
+        ) = adjust_swap_tokens(&trade);
+
+        let raw_amount_in = spl_token::ui_amount_to_amount(amount_in, in_decimals);
+        let raw_min_amount_out = spl_token::ui_amount_to_amount(min_amount_out, out_decimals);
+        let bloxroute_bribe = spl_token::ui_amount_to_amount(
+            trade.strategy.buy_bribe.unwrap_or(0.0),
+            in_decimals,
+        );
 
         let buy_order = Order::new(
-            OrderDirection::BaseIn,
+            OrderDirection::QuoteIn,
             trade.id,
             OrderKind::SimpleBuy,
             &trade.pool_keys,
-            amount_in,
-            min_amount_out,
-            &trade.pool_keys.quote_mint,
-            &trade.pool_keys.base_mint,
-            trade.quote_decimals,
-            trade.base_decimals,
+            raw_amount_in,
+            raw_min_amount_out,
+            &in_mint,
+            &out_mint,
+            in_decimals,
+            out_decimals,
             // Determine the executor type for the buy order
             if use_bloxroute {
                 ExecutorType::Bloxroute
             } else {
                 ExecutorType::RPC
             },
-            trade.strategy.buy_bribe,
+            bloxroute_bribe,
             trade.strategy.buy_delay,
         );
 
@@ -967,6 +1024,32 @@ impl Trader {
         // If no target value is provided, skip the condition check and return true
         true
     }
+}
+
+/// Adjusts the quote and base tokens used in the swap based on the mint types.
+/// If the base mint is wrapped SOL or USDC, the tokens are swapped to
+/// ensure that quote token is always the main currency for trading.
+fn adjust_swap_tokens(trade: &Trade) -> (Pubkey, Pubkey, u8, u8) {
+    let keys = &trade.pool_keys;
+
+    // If the base mint is wrapped SOL or USDC we need to swap base and quote tokens
+    let (in_mint, out_mint) = {
+        if keys.base_mint == spl_token::native_mint::id() || keys.base_mint.to_string() == USDC_MINT {
+            (keys.base_mint, keys.quote_mint)
+        } else {
+            (keys.quote_mint, keys.base_mint)
+        }
+    };
+
+    let (in_decimals, out_decimals) = {
+        if keys.base_mint == spl_token::native_mint::id() || keys.base_mint.to_string() == USDC_MINT {
+            (trade.base_decimals, trade.quote_decimals)
+        } else {
+            (trade.quote_decimals, trade.base_decimals)
+        }
+    };
+
+    (in_mint, out_mint, in_decimals, out_decimals)
 }
 
 pub fn current_timestamp() -> u64 {

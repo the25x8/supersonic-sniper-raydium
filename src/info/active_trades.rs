@@ -64,7 +64,7 @@ fn format_active_trade_row(trade: &Trade) -> String {
         .unwrap()
         .to_rfc3339();
 
-    let amount = format!("{:.2}", trade.quote_in_amount);
+    let amount = format!("{:.9}", trade.quote_in_amount);
 
     let tokens = if trade.buy_price > 0.0 {
         let tokens_bought = trade.quote_in_amount / trade.buy_price;

@@ -1,6 +1,7 @@
 use std::fmt;
 use log::warn;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use solana_program::native_token::lamports_to_sol;
 use solana_program::pubkey::Pubkey;
 use uuid::Uuid;
 
@@ -27,6 +28,7 @@ pub struct Trade {
     pub strategy: StrategyConfig, // The strategy used for the trade
     pub status: TradeStatus, // The status of the trade
     pub wallet: Pubkey, // SOL wallet address used to send txs and receive tokens
+    pub error: Option<String>, // Error message if the trade failed
 
     pub base_decimals: u8,
     pub quote_decimals: u8,
@@ -36,6 +38,7 @@ pub struct Trade {
     pub quote_out_amount: f64,
 
     // Snapshots of the base prices at the time of the trade
+    #[serde(deserialize_with = "deserialize_f64_null_as_nan")]
     pub buy_price: f64,
     pub sell_price: f64,
 
@@ -48,6 +51,10 @@ pub struct Trade {
     pub hold_time_order: Option<Order>,
     pub stop_loss_order: Option<Order>,
     pub take_profit_order: Option<Order>,
+
+    pub total_fee: f64, // Total fee paid for the trade in lamports
+    pub total_compute_units: u64, // Total compute units consumed for the trade
+    pub total_bribe: f64, // Total bribe paid to the executors for the trade
 
     // Timestamps for tracking the trade lifecycle
     pub created_at: u64,
@@ -87,6 +94,10 @@ impl Trade {
             stop_loss_order: None,
             take_profit_order: None,
             hold_time_order: None,
+            error: None,
+            total_fee: 0.0,
+            total_compute_units: 0,
+            total_bribe: 0.0,
             created_at: timestamp,
             updated_at: 0,
             completed_at: 0,
@@ -107,8 +118,14 @@ impl Trade {
         }
 
         // Add buy order in amount to the trade metadata
-        self.quote_in_amount = order.amount;
+        let buy_amount = spl_token::amount_to_ui_amount(order.amount, order.in_decimals);
+        self.quote_in_amount = buy_amount;
+
+        // Add the order bribe to the total bribe for the trade
+        let bribe = spl_token::amount_to_ui_amount(order.executor_bribe, order.in_decimals);
+        self.total_bribe += bribe;
         self.buy_order = Some(order); // Register the buy order for the trade
+
         self.updated_at = current_timestamp();
 
         Ok(())
@@ -133,25 +150,26 @@ impl Trade {
     /// Completes the trade after the sell order is confirmed in the blockchain.
     /// It calculates the profit amount, profit percentage, and sell price of
     /// the trade, and updates the status of the sell order.
-    pub fn sell(
-        &mut self,
-        kind: OrderKind,
-        in_amount: f64, // In amount is the amount of base tokens
-        out_amount: f64, // Out amount is the amount of quote tokens
-        tx_id: String,
-        timestamp: u64,
-    ) -> Result<(), String> {
+    pub fn sell(&mut self, order: &Order) -> Result<(), String> {
         // Skip if the trade is already completed or cancelled
         if self.status == TradeStatus::Completed || self.status == TradeStatus::Cancelled {
             return Err("Trade is already completed or cancelled".to_string());
         }
 
         // Update the trade status after the sell order is confirmed
-        self.quote_out_amount = out_amount;
+        let received_amount = spl_token::amount_to_ui_amount(order.amount, order.out_decimals);
+        self.quote_out_amount = received_amount;
         self.status = TradeStatus::Completed;
 
-        // Calculate sell price
-        self.sell_price = out_amount / in_amount;
+        // Divide the in amount by the out amount to get the sell price
+        let in_amount = spl_token::amount_to_ui_amount(order.amount, order.in_decimals);
+        let out_amount = spl_token::amount_to_ui_amount(order.balance_change, order.out_decimals);
+
+        self.sell_price = out_amount / in_amount; // Formula: quote_token / base_token
+
+        // Update the total fee and compute units for the trade
+        self.total_fee += lamports_to_sol(order.fee);
+        self.total_compute_units += order.compute_units_consumed;
 
         // Mark the trade as completed
         let sell_timestamp = current_timestamp();
@@ -162,60 +180,75 @@ impl Trade {
         self.profit_amount = self.quote_out_amount - self.quote_in_amount;
         self.profit_percent = (self.profit_amount / self.quote_in_amount) * 100.0;
 
-        // Based on the kind get the sell order and update its status
-        let sell_order = match kind {
-            OrderKind::HoldTime => {
-                if let Some(hold_time_order) = self.hold_time_order.as_mut() {
-                    hold_time_order
-                } else {
-                    return Err("Hold time order not found".to_string());
-                }
-            }
-            OrderKind::TakeProfit => {
-                if let Some(take_profit_order) = self.take_profit_order.as_mut() {
-                    take_profit_order
-                } else {
-                    return Err("Take profit order not found".to_string());
-                }
-            }
-            OrderKind::StopLoss => {
-                if let Some(stop_loss_order) = self.stop_loss_order.as_mut() {
-                    stop_loss_order
-                } else {
-                    return Err("Stop loss order not found".to_string());
-                }
-            }
+        // Replace the sell order with the confirmed order
+        match order.kind {
+            OrderKind::HoldTime => self.hold_time_order = Some(order.clone()),
+            OrderKind::TakeProfit => self.take_profit_order = Some(order.clone()),
+            OrderKind::StopLoss => self.stop_loss_order = Some(order.clone()),
             _ => return Err("Invalid kind of the order".to_string()),
-        };
-
-        // Assign the blockchain tx details and timestamps
-        sell_order.tx_id = Some(tx_id);
-        sell_order.status = OrderStatus::Completed;
-        sell_order.confirmed_at = timestamp;
+        }
 
         Ok(())
     }
 
     /// Completes the buy order for the trade after it is confirmed in the blockchain.
     /// It calculates the buy price and updates the status of the buy order.
-    pub fn buy(
-        &mut self,
-        in_amount: f64, // In amount is the amount of quote tokens
-        out_amount: f64, // Out amount is the amount of base tokens
-        tx_id: String,
-        timestamp: u64,
-    ) {
-        self.buy_price = in_amount / out_amount; // Formula: quote_token_amount / base_token_amount
+    pub fn buy(&mut self, order: &Order) {
+        // Formula: quote_token / base_token
+        let in_amount = spl_token::amount_to_ui_amount(order.amount, order.in_decimals);
+        let out_amount = spl_token::amount_to_ui_amount(order.balance_change, order.out_decimals);
+        self.buy_price = in_amount / out_amount;
 
         // Update the trade status after the buy order is confirmed
         self.status = TradeStatus::Active;
         self.updated_at = current_timestamp();
 
-        // Update the buy order status
-        if let Some(buy_order) = self.buy_order.as_mut() {
-            buy_order.status = OrderStatus::Completed;
-            buy_order.tx_id = Some(tx_id);
-            buy_order.confirmed_at = timestamp;
+        // Update the total fee and compute units for the trade
+        self.total_fee += lamports_to_sol(order.fee);
+        self.total_compute_units += order.compute_units_consumed;
+
+        // Replace the buy order with the confirmed order
+        self.buy_order = Some(order.clone());
+    }
+
+    /// Marks the trade as failed and cancels all orders.
+    /// It is used when the trade cannot be completed due to some error.
+    pub fn fail(&mut self, error: &str) {
+        // Update the trade status
+        self.status = TradeStatus::Error;
+        self.error = Some(error.to_string());
+        self.updated_at = current_timestamp();
+
+        // Cancel buy order only if it is not completed
+        if let Some(order) = self.buy_order.as_mut() {
+            if order.status != OrderStatus::Completed {
+                order.status = OrderStatus::Cancelled;
+                order.cancelled_at = current_timestamp();
+            }
+        }
+
+        // Cancel hold time order only if it is not completed
+        if let Some(order) = self.hold_time_order.as_mut() {
+            if order.status != OrderStatus::Completed {
+                order.status = OrderStatus::Cancelled;
+                order.cancelled_at = current_timestamp();
+            }
+        }
+
+        // Cancel take profit order only if it is not completed
+        if let Some(order) = self.take_profit_order.as_mut() {
+            if order.status != OrderStatus::Completed {
+                order.status = OrderStatus::Cancelled;
+                order.cancelled_at = current_timestamp();
+            }
+        }
+
+        // Cancel stop loss order only if it is not completed
+        if let Some(order) = self.stop_loss_order.as_mut() {
+            if order.status != OrderStatus::Completed {
+                order.status = OrderStatus::Cancelled;
+                order.cancelled_at = current_timestamp();
+            }
         }
     }
 
@@ -273,7 +306,6 @@ impl Trade {
     }
 }
 
-
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum TradeStatus {
@@ -281,6 +313,7 @@ pub enum TradeStatus {
     Active = 2,
     Cancelled = 3,
     Completed = 4,
+    Error = 5,
 }
 
 impl fmt::Display for TradeStatus {
@@ -290,6 +323,7 @@ impl fmt::Display for TradeStatus {
             TradeStatus::Active => write!(f, "Active"),
             TradeStatus::Cancelled => write!(f, "Cancelled"),
             TradeStatus::Completed => write!(f, "Completed"),
+            TradeStatus::Error => write!(f, "Error"),
         }
     }
 }
@@ -299,4 +333,11 @@ impl fmt::Display for TradeStatus {
 pub enum TradeExchange {
     Raydium = 1,
     Serum = 2,
+}
+
+/// A helper to deserialize `f64`, treating JSON null as f64::NAN.
+/// See https://github.com/serde-rs/json/issues/202
+fn deserialize_f64_null_as_nan<'de, D: Deserializer<'de>>(des: D) -> Result<f64, D::Error> {
+    let optional = Option::<f64>::deserialize(des)?;
+    Ok(optional.unwrap_or(f64::NAN))
 }

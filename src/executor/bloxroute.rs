@@ -7,7 +7,7 @@ use solana_sdk::transaction::Transaction;
 /// Send swap details to Bloxroute API and return the unsigned transaction.
 pub async fn create_swap_tx(
     serialized_tx: &[u8],
-) -> Result<Transaction, Box<dyn std::error::Error>> {
+) -> Result<Transaction, Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
 
     // Return mock transaction for testing

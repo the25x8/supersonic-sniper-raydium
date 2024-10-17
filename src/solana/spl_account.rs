@@ -74,7 +74,7 @@ pub fn build_spl_token_account_instructions(
 pub fn build_close_spl_token_account_instruction(
     payer_pubkey: &Pubkey,
     token_account_pubkey: &Pubkey,
-) -> Result<Instruction, Box<dyn std::error::Error>> {
+) -> Result<Instruction, Box<dyn std::error::Error + Send + Sync>> {
     use spl_token::instruction::close_account;
 
     let close_account_ix = close_account(
@@ -92,7 +92,7 @@ pub async fn close_spl_token_account(
     payer: &Keypair,
     token_mint: &Pubkey,
     rpc_client: &solana_client::rpc_client::RpcClient,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let close_account_ix = build_close_spl_token_account_instruction(
         &payer.pubkey(),
         token_mint,
