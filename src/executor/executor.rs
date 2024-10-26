@@ -7,6 +7,7 @@ use futures::StreamExt;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use log::{error, info};
 use solana_client::rpc_config::RpcSendTransactionConfig;
+use solana_program::hash::Hash;
 use solana_program::pubkey::Pubkey;
 use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::signature::Signature;
@@ -95,9 +96,9 @@ impl Executor {
                     Some(order) = delay_queue_rx.recv() => {
                         let id = order.id.clone();
                         let delay = get_delay_duration(order.delay, order.delayed_at);
-                        let order_key = delay_queue.insert(order, delay);
 
                         // Save the order key to the order_keys map
+                        let order_key = delay_queue.insert(order, delay);
                         order_keys.insert(id, order_key);
                     }
 
@@ -106,7 +107,7 @@ impl Executor {
                         // Find the order key in the order_keys map
                         // and remove it from the delay queue.
                         if let Some(order_key) = order_keys.remove(&order_id) {
-                            delay_queue.remove(&order_key);
+                            delay_queue.try_remove(&order_key);
                         }
                     }
 
@@ -271,140 +272,153 @@ async fn execute_order(
     let bloxroute_enabled = bloxroute_config.enabled && order.executor == ExecutorType::Bloxroute;
     let start_time = Utc::now().time();
 
-    // Get the latest blockhash
-    let recent_blockhash = match rpc_client
-        .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
-        .await {
-        Ok((blockhash, _)) => blockhash,
-        Err(e) => {
-            error!("Failed to get latest blockhash: {}", e);
-            return Err(Box::new(e));
-        }
-    };
+    let mut attempts = 0;
 
-    // Build the unsigned transaction for the order
-    let tx = {
-        // If enabled and create_swap_tx is true, create the swap tx via Bloxroute API
-        if bloxroute_enabled && bloxroute_config.create_swap_tx {
-            match bloxroute::create_swap_tx(&[]).await {
-                Ok(tx) => tx,
-                Err(e) => {
-                    error!("Failed to create swap tx via Bloxroute: {}", e);
-                    return Err(e);
-                }
-            };
-        }
-
-        // Otherwise, build the tx locally. It will include the bribe
-        // transfer instruction if the executor is Bloxroute.
-        match order.direction {
-            OrderDirection::QuoteIn => {
-                match swap::create_swap_in_tx(
-                    &wallet.keypair,
-                    &order,
-                    &recent_blockhash,
-                    executor_config.compute_unit_limit,
-                    executor_config.compute_unit_price,
-                    bloxroute_enabled,
-                ).await {
-                    Ok(tx) => tx,
-                    Err(e) => {
-                        error!("Failed to build swap in transaction for order: {}", e);
-                        return Err(e);
-                    }
-                }
-            }
-            OrderDirection::QuoteOut => {
-                match swap::create_swap_out_tx(
-                    &wallet.keypair,
-                    &order,
-                    &recent_blockhash,
-                    executor_config.compute_unit_limit,
-                    executor_config.compute_unit_price,
-                    bloxroute_enabled,
-                ).await {
-                    Ok(tx) => tx,
-                    Err(e) => {
-                        error!("Failed to build swap out transaction for order: {}", e);
-                        return Err(e);
-                    }
-                }
-            }
-        }
-    };
-
-    // Broadcast the transaction to the blockchain and get the signature
-    let signature = if bloxroute_enabled {
-        // Send signed tx to blockchain via Bloxroute API and wait for confirmation
-        // match bloxroute::send_tx(&tx).await {
-        //     Ok(signature) => signature,
-        //     Err(e) => {
-        //         error!("Failed to send transaction via Bloxroute: {}", e);
-        //         return Err(Box::new(e));
-        //     }
-        // }
-
-        // Simulate tx confirmation and receipt time (~2000ms / 5 blocks)
-        tokio::time::sleep(Duration::from_millis(2000)).await;
-        tx.signatures[0]
-    } else {
-        // Send and confirm the transaction via RPC client
-        match send_and_confirm(rpc_client.clone(), &tx).await {
-            Ok(signature) => signature,
+    loop {
+        // Get the latest blockhash
+        let recent_blockhash = match rpc_client
+            .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+            .await {
+            Ok((blockhash, _)) => blockhash,
             Err(e) => {
-                error!("Failed to send and confirm transaction: {}", e);
-                return Err(e);
+                error!("Failed to get latest blockhash: {}", e);
+                return Err(Box::new(e));
             }
-        }
+        };
 
-        // // Simulate tx confirmation and receipt time (~15000ms / 37 blocks)
-        // tokio::time::sleep(Duration::from_millis(15000)).await;
-        // tx.signatures[0]
-    };
+        // Build the unsigned transaction for the order
+        let tx = {
+            // If enabled and create_swap_tx is true, create the swap tx via Bloxroute API
+            if bloxroute_enabled && bloxroute_config.create_swap_tx {
+                match bloxroute::create_swap_tx(&[]).await {
+                    Ok(tx) => tx,
+                    Err(e) => {
+                        error!("Failed to create swap tx via Bloxroute: {}", e);
+                        return Err(e);
+                    }
+                };
+            }
 
-    let signature_string = &signature.to_string();
+            // Otherwise, build the tx locally. It will include the bribe
+            // transfer instruction if the executor is Bloxroute.
+            match order.direction {
+                OrderDirection::QuoteIn => {
+                    match swap::create_swap_in_tx(
+                        &wallet.keypair,
+                        &order,
+                        &recent_blockhash,
+                        executor_config.compute_unit_limit,
+                        executor_config.compute_unit_price,
+                        bloxroute_enabled,
+                    ).await {
+                        Ok(tx) => tx,
+                        Err(e) => {
+                            error!("Failed to build swap in transaction for order: {}", e);
+                            return Err(e);
+                        }
+                    }
+                }
+                OrderDirection::QuoteOut => {
+                    match swap::create_swap_out_tx(
+                        &wallet.keypair,
+                        &order,
+                        &recent_blockhash,
+                        executor_config.compute_unit_limit,
+                        executor_config.compute_unit_price,
+                        bloxroute_enabled,
+                    ).await {
+                        Ok(tx) => tx,
+                        Err(e) => {
+                            error!("Failed to build swap out transaction for order: {}", e);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        };
 
-    // Get the transaction metadata by signature
-    let tx_meta = match solana::get_transaction_metadata(
-        &rpc_client,
-        signature_string,
-    ).await {
-        Ok(meta) => meta,
-        Err(e) => {
-            error!("Failed to fetch confirmed transaction: {}", e);
-            return Err(e);
-        }
-    };
+        // Broadcast the transaction to the blockchain and get the signature
+        let signature = if bloxroute_enabled {
+            // Send signed tx to blockchain via Bloxroute API and wait for confirmation
+            // match bloxroute::send_tx(&tx).await {
+            //     Ok(signature) => signature,
+            //     Err(e) => {
+            //         error!("Failed to send transaction via Bloxroute: {}", e);
+            //         return Err(Box::new(e));
+            //     }
+            // }
 
-    // Get compute units consumed
-    let compute_units_consumed = match tx_meta.compute_units_consumed {
-        OptionSerializer::Some(units) => units,
-        _ => 0,
-    };
+            // Simulate tx confirmation and receipt time (~2000ms / 5 blocks)
+            tokio::time::sleep(Duration::from_millis(2000)).await;
+            tx.signatures[0]
+        } else {
+            // Send and confirm the transaction via RPC client
+            match confirm_and_send_tx(rpc_client.clone(), &tx, &recent_blockhash).await {
+                Ok(signature) => signature,
+                Err(e) => {
+                    error!("Failed to send and confirm transaction: {}", e);
 
-    // Compute out token address and extract the real amount out from the tx metadata
-    let received_amount = match extract_token_balance_change(
-        &tx_meta,
-        &wallet.pubkey,
-        &order.out_mint,
-    ) {
-        Some((_, _, amount_change)) => amount_change,
-        None => {
-            error!("Destination token balance change not found in transaction metadata");
-            return Err("Destination token balance change not found".into());
-        }
-    };
+                    // Increment retry attempt counter and handle retry logic
+                    match handle_attempt(&mut attempts, MAX_TX_RETRIES as u32, 300).await {
+                        Ok(_) => continue,
+                        Err(_) => return Err("Transaction details not found".into()),
+                    }
+                }
+            }
 
-    // Confirm the order with the transaction signature
-    order.confirm(
-        signature_string,
-        received_amount,
-        tx_meta.fee,
-        compute_units_consumed,
-        current_timestamp(),
-    );
+            // // Simulate tx confirmation and receipt time (~15000ms / 37 blocks)
+            // tokio::time::sleep(Duration::from_millis(15000)).await;
+            // tx.signatures[0]
+        };
 
-    info!(
+        let signature_string = &signature.to_string();
+
+        // Get the transaction metadata by signature
+        let tx_meta = match solana::get_transaction_metadata(
+            &rpc_client,
+            signature_string,
+        ).await {
+            Ok(meta) => meta,
+            Err(e) => {
+                error!("Failed to fetch confirmed transaction: {}", e);
+
+                // Increment retry attempt counter and handle retry logic
+                match handle_attempt(&mut attempts, MAX_TX_RETRIES as u32, 300).await {
+                    Ok(_) => continue,
+                    Err(_) => return Err("Transaction details not found".into()),
+                }
+            }
+        };
+
+        // Get compute units consumed
+        let compute_units_consumed = match tx_meta.compute_units_consumed {
+            OptionSerializer::Some(units) => units,
+            _ => 0,
+        };
+
+        // Compute out token address and extract the real amount out from the tx metadata
+        let received_amount = match extract_token_balance_change(
+            &tx_meta,
+            &wallet.pubkey,
+            &order.out_mint,
+        ) {
+            Some((_, _, amount_change)) => amount_change,
+            None => {
+                error!("Destination token balance change not found in transaction metadata");
+                return Err("Destination token balance change not found".into());
+            }
+        };
+
+        // Confirm the order with the transaction signature
+        order.confirm(
+            signature_string,
+            received_amount,
+            tx_meta.fee,
+            compute_units_consumed,
+            current_timestamp(),
+        );
+
+        info!(
         "\n✅ Order Executed!\n\
          ─────────────────────────────────────────────────────\n\
          ▶️ Trade ID:        {}\n\
@@ -433,82 +447,42 @@ async fn execute_order(
         signature_string,
     );
 
-    Ok(order)
+        return Ok(order);
+    }
 }
 
-async fn send_and_confirm(
+async fn confirm_and_send_tx(
     rpc_client: Arc<RpcClient>,
     tx: &VersionedTransaction,
+    recent_blockhash: &Hash,
 ) -> Result<Signature, Box<dyn std::error::Error + Send + Sync>> {
-    // Wait for the transaction to be confirmed
-    let mut attempts = 0;
+    // Send tx via RPC client and wait for confirmation
+    let signature = match rpc_client
+        .send_transaction_with_config(tx, RpcSendTransactionConfig {
+            encoding: Some(UiTransactionEncoding::Base64),
+            skip_preflight: true, // Skip preflight checks for faster execution
+            max_retries: Some(0), // Do not retry on failure here
+            preflight_commitment: Some(CommitmentLevel::Confirmed),
+            min_context_slot: None,
+        })
+        .await {
+        Ok(signature) => signature,
+        Err(e) => {
+            error!("Failed to send transaction: {}", e);
+            return Err(Box::new(e));
+        }
+    };
 
-    loop {
-        // Get the latest blockhash again to ensure it's up-to-date
-        let recent_blockhash = match rpc_client
-            .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
-            .await {
-            Ok((blockhash, _)) => blockhash,
-            Err(e) => {
-                error!("Failed to get latest blockhash: {}", e);
-
-                // Increment retry attempt counter and handle retry logic
-                match handle_attempt(&mut attempts, MAX_FETCH_RETRIES, 300).await {
-                    Ok(_) => continue,
-                    Err(_) => {
-                        // TODO Handle failed transaction confirmation gracefully
-                        return Err(Box::new(e))
-                    }
-                }
-            }
-        };
-
-        // Send tx via RPC client and wait for confirmation
-        let signature = match rpc_client.send_transaction_with_config(
-            tx,
-            RpcSendTransactionConfig {
-                encoding: Some(UiTransactionEncoding::Base64),
-                skip_preflight: true, // Skip preflight checks for faster execution
-                max_retries: Some(MAX_TX_RETRIES),
-                preflight_commitment: Some(CommitmentLevel::Confirmed),
-                min_context_slot: None,
-            },
-        ).await {
-            Ok(signature) => signature,
-            Err(e) => {
-                error!("Failed to send transaction: {}", e);
-
-                // Increment retry attempt counter and handle retry logic
-                match handle_attempt(&mut attempts, MAX_TX_RETRIES as u32, 300).await {
-                    Ok(_) => continue,
-                    Err(_) => {
-                        // TODO Handle failed transaction confirmation gracefully
-                        return Err(Box::new(e))
-                    }
-                }
-            }
-        };
-
-        // Wait for the transaction to be confirmed
-        match rpc_client.confirm_transaction_with_spinner(
-            &signature,
-            &recent_blockhash,
-            CommitmentConfig::confirmed(),
-        ).await {
-            Ok(_) => return Ok(signature), // Return the signature if confirmed
-            Err(e) => {
-                error!("Failed to confirm transaction: {}", e);
-
-                // Increment retry attempt counter and handle retry logic
-                match handle_attempt(&mut attempts, MAX_FETCH_RETRIES, 300).await {
-                    Ok(_) => continue,
-                    Err(_) => {
-                        // TODO Handle failed transaction confirmation gracefully
-                        return Err(Box::new(e))
-                    }
-                }
-            }
-        };
+    match rpc_client.confirm_transaction_with_spinner(
+        &signature,
+        recent_blockhash,
+        CommitmentConfig::confirmed(),
+    ).await {
+        Ok(_) => Ok(signature),
+        Err(e) => {
+            error!("Failed to confirm transaction: {}", e);
+            Err(Box::new(e))
+        }
     }
 }
 

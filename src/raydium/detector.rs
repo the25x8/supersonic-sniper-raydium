@@ -202,7 +202,7 @@ impl RaydiumDetector {
                 match pubsub.logs_subscribe(
                     RpcTransactionLogsFilter::All,
                     RpcTransactionLogsConfig {
-                        commitment: Some(CommitmentConfig::processed()),
+                        commitment: Some(CommitmentConfig::confirmed()),
                     },
                 ).await {
                     Ok((accounts, logs_unsubscribe)) => (accounts, logs_unsubscribe),

@@ -177,10 +177,9 @@ pub struct LiquidityStateV4 {
 
 #[derive(Debug)]
 pub struct LiquidityCheckResult {
-    pub is_locked: bool,
+    pub locked: bool,
     pub burnt: f64,
-    pub pool_address: Pubkey,
-    pub address: Pubkey,
+    pub lp_mint: Pubkey,
 }
 
 pub async fn get_amm_liquidity_state(rpc_client: Arc<RpcClient>, amm_id: &Pubkey) -> Result<LiquidityStateV4, Box<dyn std::error::Error + Send + Sync>> {
@@ -245,13 +244,10 @@ pub async fn get_amm_pool_reserves(
 /// locked if the percentage of burnt LP tokens is greater than 95%.
 /// If lp_amount isn't provided, the function will fetch liquidity pool data.
 pub async fn check_liquidity(
-    pool_keys: &PoolKeys,
+    lp_mint: &Pubkey,
     mut lp_reserve: f64,
     rpc_client: Arc<RpcClient>,
 ) -> Result<LiquidityCheckResult, Box<dyn Error + Send + Sync>> {
-    // Get lp_mint and lp_reserve from liquidity_state
-    let lp_mint = pool_keys.lp_mint;
-
     // Fetch mint account info for lp_mint
     let mint_account_info = rpc_client.get_account(&lp_mint).await?;
     let mint_data = mint_account_info.data;
@@ -281,25 +277,11 @@ pub async fn check_liquidity(
     // Determine if liquidity is locked
     let is_liquidity_locked = burn_pct > 95.0;
 
-    // Print all the values in one info!
-    info!(
-        "Liquidity Check:\n\
-        is_liquidity_locked: {}\n\
-        burn_pct: {:.2}%\n\
-        pool_address: {}\n\
-        token_address: {}",
-        is_liquidity_locked,
-        burn_pct,
-        pool_keys.id,
-        lp_mint,
-    );
-
     // Build the result
     let result = LiquidityCheckResult {
-        is_locked: is_liquidity_locked,
+        locked: is_liquidity_locked,
         burnt: burn_pct,
-        pool_address: pool_keys.id,
-        address: lp_mint,
+        lp_mint: *lp_mint,
     };
 
     Ok(result)

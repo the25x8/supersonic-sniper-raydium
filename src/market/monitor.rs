@@ -403,7 +403,7 @@ impl MarketMonitor {
                     // Fetch the reserves of the AMM pool if cache is stale or empty
                     let (base_reserves, quote_reserves) =
                         match raydium::get_amm_pool_reserves(
-                            rpc_client,
+                            rpc_client.clone(),
                             &state.coin_vault,
                             &state.pc_vault,
                         ).await {
@@ -428,15 +428,30 @@ impl MarketMonitor {
                         }
                     };
 
+                    // Liquidity rug pull check
+                    let liquidity_check = match raydium::check_liquidity(
+                        &state.lp_mint,
+                        state.lp_amount as f64,
+                        rpc_client,
+                    ).await {
+                        Ok(liquidity_check) => liquidity_check,
+                        Err(e) => {
+                            error!("Failed to check liquidity: {}", e);
+                            return Err(e);
+                        }
+                    };
+
                     debug!(
                         "Market data updated for pool {}\n\
                         Base reserves: {}\n\
                         Quote reserves: {}\n\
-                        Price: {}\n",
+                        Price: {}\n\
+                        Liquidity check: {:?}\n",
                         pubkey,
                         base_reserves.ui_amount_string.to_string(),
                         quote_reserves.ui_amount_string.to_string(),
-                        price
+                        price,
+                        liquidity_check
                     );
 
                     // Send market data to the market_tx channel

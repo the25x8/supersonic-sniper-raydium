@@ -156,16 +156,13 @@ impl Trade {
             return Err("Trade is already completed or cancelled".to_string());
         }
 
-        // Update the trade status after the sell order is confirmed
-        let received_amount = spl_token::amount_to_ui_amount(order.amount, order.out_decimals);
-        self.quote_out_amount = received_amount;
-        self.status = TradeStatus::Completed;
-
         // Divide the in amount by the out amount to get the sell price
         let in_amount = spl_token::amount_to_ui_amount(order.amount, order.in_decimals);
         let out_amount = spl_token::amount_to_ui_amount(order.balance_change, order.out_decimals);
 
         self.sell_price = out_amount / in_amount; // Formula: quote_token / base_token
+        self.quote_out_amount = out_amount;
+        self.status = TradeStatus::Completed;
 
         // Update the total fee and compute units for the trade
         self.total_fee += lamports_to_sol(order.fee);
