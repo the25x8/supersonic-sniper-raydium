@@ -1,8 +1,8 @@
 use std::error::Error;
 use std::str::FromStr;
 use std::sync::Arc;
-use borsh::BorshDeserialize;
 use base64::Engine;
+use borsh::BorshDeserialize;
 use chrono::{TimeZone, Utc};
 use dashmap::DashSet;
 use futures::{SinkExt, StreamExt};
@@ -25,10 +25,9 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use crate::config::BloxrouteConfig;
-use crate::raydium::MainnetProgramId;
-use crate::detector::{DetectedPool, Pool, PoolKeys, PoolType, SourceType};
+use crate::raydium::{MainnetProgramId, LiquidityStateV4};
+use crate::detector::{DetectedPool, AMMPool, PoolKeys, PoolType, SourceType};
 use crate::error::handle_attempt;
-use crate::raydium::liquidity::LiquidityStateV4;
 
 const MAX_SUBSCRIPTION_RETRIES: u32 = 5; // Maximum number of subscription retries
 const RECONNECT_BACKOFF: u64 = 1000; // Reconnection backoff in milliseconds
@@ -167,18 +166,15 @@ impl RaydiumDetector {
         }
     }
 
+    /// Begin the subscription process for the Raydium AMM pools.
     pub async fn start(&self) {
-        // If Bloxroute is enabled, subscribe to both PubSub and Bloxroute streams
+        // If Bloxroute is enabled, subscribe to the new pools via Bloxroute
         if self.bloxroute_config.enabled {
-            tokio::join!(
-                self.subscribe_to_amm_pool_initialize(),
-                self.subscribe_to_amm_pools_pubsub(),
-                self.subscribe_to_amm_pools_bloxroute(),
-            );
+            self.subscribe_to_amm_pools_bloxroute().await;
             return;
         }
 
-        // Otherwise, subscribe to the initialize2 logs and PubSub stream
+        // Otherwise, subscribe to the initialize2 logs and pool stream via PubSub
         tokio::join!(
             self.subscribe_to_amm_pool_initialize(),
             self.subscribe_to_amm_pools_pubsub(),
@@ -455,7 +451,7 @@ impl RaydiumDetector {
 
                     // Build the DetectedPool instance
                     let pool_open_time = Utc.timestamp_opt(state.state_data.pool_open_time as i64, 0).unwrap();
-                    let pool_info = Pool {
+                    let pool_info = AMMPool {
                         keys: pool_keys,
                         in_whitelist: false,
                         slot: 0,
@@ -644,7 +640,7 @@ impl RaydiumDetector {
                                             market_event_queue: Pubkey::from_str(pool.liquidity_pool_keys.market_event_queue.as_str()).unwrap(),
                                             trade_fee_rate: 0,
                                         };
-                                        let pool_info = Pool {
+                                        let pool_info = AMMPool {
                                             keys: pool_keys,
                                             in_whitelist: false,
                                             slot: event.params.result.slot.parse().unwrap_or(0),
@@ -686,7 +682,7 @@ impl RaydiumDetector {
                                         );
                                     }
                                     BXPoolEvent::WsError(event) => {
-                                        error!("Bloxroute WebSocket error: {}", event.error.message);
+                                        error!("Bloxroute WebSocket error: {:?}", event.error);
                                         break;
                                     }
                                 }

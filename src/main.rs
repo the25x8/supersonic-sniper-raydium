@@ -1,17 +1,16 @@
 mod config;
 mod wallet;
 mod trader;
-mod detector;
 mod raydium;
 mod error;
 mod info;
 mod solana;
 mod executor;
 mod market;
-
-use detector::Pool;
+mod detector;
 
 use std::sync::Arc;
+use std::time::Duration;
 use clap::{Arg, ArgAction, Command};
 use log::{error, info};
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -20,6 +19,8 @@ use tokio::signal;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+
+const VERSION: &str = "0.2";
 
 #[tokio::main]
 async fn main() {
@@ -63,7 +64,7 @@ async fn main() {
 async fn run_app(shutdown_token: CancellationToken) {
     // Define CLI using Clap
     let matches = Command::new("Supersonic Sniper Bot")
-        .version("0.1.0")
+        .version(VERSION)
         .author("25x8 <25x8@tuta.io>")
         .about("A high-performance sniper bot for Raydium AMM on Solana")
         .arg(
@@ -165,12 +166,16 @@ async fn run_app(shutdown_token: CancellationToken) {
     };
 
     // Create the detected pool channel
-    let (pool_tx, pool_rx) = mpsc::channel::<Pool>(10);
+    let (pool_tx, pool_rx) = mpsc::channel::<detector::AMMPool>(10);
 
     // Initialize solana RPC client with commitment
-    let rpc_client = RpcClient::new_with_commitment(
+    let rpc_client_timeout = Duration::from_secs(10);
+    let confirm_tx_initial_timeout = Duration::from_secs(20);
+    let rpc_client = RpcClient::new_with_timeouts_and_commitment(
         app_config_arc.rpc.url.to_string().clone(),
-        CommitmentConfig::processed(), // for faster fetching
+        rpc_client_timeout,
+        CommitmentConfig::processed(),
+        confirm_tx_initial_timeout,
     );
 
     // Wrap the RpcClient in an Arc for shared ownership
@@ -193,8 +198,9 @@ async fn run_app(shutdown_token: CancellationToken) {
             info!(
                 "\n\
                 🚀 Supersonic Sniper Bot is initializing...\n\
-                ▶️ Version: v0.1\n\
-                ───────────────────────────────────────\n"
+                ▶️ Version: v{}\n\
+                ───────────────────────────────────────\n",
+                VERSION
             );
 
             // Initialize the trader module
@@ -265,7 +271,7 @@ ____/ // /_/ /__  /_/ /  __/  /        ____/ // /_/ /  / / /  / / /__
 /____/ \__,_/ _  .___/\___//_/         /____/ \____//_/ /_//_/  \___/  
               /_/                                                      
 
-Super Sonic Sniper Bot v0.2.0 - The High-Speed Trading Bot for Raydium AMM
+Super Sonic Sniper Bot - The High-Speed Trading Bot for Raydium AMM
 ────────────────────────────────────────────────────────────────────────
 "#
     );

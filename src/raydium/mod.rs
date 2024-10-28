@@ -1,4 +1,3 @@
-pub mod detector;
 mod instructions;
 mod liquidity;
 

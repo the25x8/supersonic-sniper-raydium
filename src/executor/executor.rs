@@ -1,14 +1,20 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use chrono::{TimeZone, Utc};
 use dashmap::DashMap;
 use futures::StreamExt;
+use jito_sdk_rust::JitoJsonRpcSDK;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use log::{error, info};
+use solana_client::nonblocking::tpu_client::TpuClient;
+use solana_client::rpc_client::SerializableTransaction;
 use solana_client::rpc_config::RpcSendTransactionConfig;
+use solana_client::tpu_client::TpuClientConfig;
 use solana_program::hash::Hash;
 use solana_program::pubkey::Pubkey;
+use solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool};
 use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::signature::Signature;
 use solana_sdk::transaction::{VersionedTransaction};
@@ -18,18 +24,26 @@ use tokio::sync::mpsc::{Sender};
 use tokio_util::sync::CancellationToken;
 use tokio_util::time::DelayQueue;
 use uuid::Uuid;
-use crate::config::{BloxrouteConfig, ExecutorConfig, ExecutorType};
+use crate::config::{AppConfig, ExecutorConfig, ExecutorType, JitoConfig};
 use crate::error::handle_attempt;
 use crate::executor::order::{Order, OrderDirection};
 use crate::executor::backup::Backup;
-use crate::executor::{bloxroute, swap};
+use crate::executor::{swap};
 use crate::solana;
 use crate::solana::extract_token_balance_change;
 use crate::wallet::Wallet;
 
 // Maximum retry attempts for sending transactions to the blockchain
-const MAX_TX_RETRIES: usize = 5;
+const MAX_SELL_RETRIES: u32 = 10;
 const MAX_FETCH_RETRIES: u32 = 3;
+
+const BLOXROUTE_TIP_ACCOUNT: &str = "HWEoBxYs7ssKuudEjzjmpfJVX7Dvi7wescFsVx2L5yoY";
+
+#[derive(Copy, Clone)]
+pub struct TipAccounts {
+    jito: Pubkey,
+    bloxroute: Pubkey,
+}
 
 pub struct Executor {
     // Sender for scheduling orders
@@ -42,12 +56,11 @@ pub struct Executor {
 
 impl Executor {
     pub async fn new(
-        client: Arc<RpcClient>,
+        rpc_client: Arc<RpcClient>,
         wallet: Arc<Wallet>,
         executed_orders_tx: Sender<Order>,
         failed_orders_tx: Sender<(Order, String)>,
-        executor_config: &ExecutorConfig,
-        bloxroute_config: &BloxrouteConfig,
+        app_config: &AppConfig,
         cancel_token: CancellationToken,
     ) -> Self {
         let (delay_queue_tx, mut delay_queue_rx) = tokio::sync::mpsc::channel::<Order>(20);
@@ -67,11 +80,49 @@ impl Executor {
             backup_clone.pending_auto_sync().await;
         });
 
+        // Initialize TPU client
+        let tpu_client = match TpuClient::new(
+            "supersonic_sniper_bot",
+            rpc_client.clone(),
+            app_config.rpc.ws_url.as_str(),
+            TpuClientConfig {
+                fanout_slots: 20
+            },
+        ).await {
+            Ok(tpu) => tpu,
+            Err(e) => {
+                panic!("Failed to initialize Solana TPU client: {}", e);
+            }
+        };
+
+        let tpu_client = Arc::new(tpu_client);
+
+        // Initialize Jito sdk and fetch a random tip account
+        let jito_sdk = Arc::new(JitoJsonRpcSDK::new(app_config.jito.url.as_str(), None));
+        let jito_tip_account = match jito_sdk.get_random_tip_account().await {
+            Ok(account) => {
+                match Pubkey::from_str(account.as_str()) {
+                    Ok(pubkey) => pubkey,
+                    Err(e) => {
+                        panic!("Failed to parse random Jito tip account: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                panic!("Failed to fetch random Jito tip account: {}", e);
+            }
+        };
+
+        // Create tip accounts struct
+        let tip_accounts = TipAccounts {
+            jito: jito_tip_account,
+            bloxroute: Pubkey::from_str(BLOXROUTE_TIP_ACCOUNT).unwrap(),
+        };
+
         // Start the executor task
         let executed_orders_tx_clone = executed_orders_tx.clone();
         let pending_orders_clone = pending_orders.clone();
-        let bloxroute_config_clone = bloxroute_config.clone();
-        let executor_config_clone = executor_config.clone();
+        let app_config_clone = app_config.clone();
         tokio::spawn(async move {
             let mut delay_queue = DelayQueue::new();
             let mut order_keys = HashMap::new();
@@ -87,14 +138,14 @@ impl Executor {
                 }
             }
 
-            let rpc_client_clone = client.clone();
+            let rpc_client_clone = rpc_client.clone();
             let wallet_clone = wallet.clone();
 
             loop {
                 tokio::select! {
                     // Receive new orders to be added to the delay queue
                     Some(order) = delay_queue_rx.recv() => {
-                        let id = order.id.clone();
+                        let id = order.id;
                         let delay = get_delay_duration(order.delay, order.delayed_at);
 
                         // Save the order key to the order_keys map
@@ -114,20 +165,34 @@ impl Executor {
                     // Process expired items from the delay queue
                     Some(expired) = delay_queue.next() => {
                         let order = expired.into_inner();
-                        let bloxroute_config_clone = bloxroute_config_clone.clone();
-                        let executor_config_clone = executor_config_clone.clone();
+
+                        // Check is requested executor is enabled, return error if it's not.
+                        if order.executor == ExecutorType::Bloxroute && !app_config_clone.bloxroute.enabled {
+                            error!("Bloxroute executor is required but not enabled");
+                            return;
+                        } else if order.executor == ExecutorType::Jito && !app_config_clone.jito.enabled {
+                            error!("Jito executor is required but not enabled");
+                            return;
+                        }
+
+                        // Clone all the required variables for the executor task
+                        let app_config_clone = app_config_clone.clone();
                         let executed_orders_tx_clone = executed_orders_tx_clone.clone();
                         let failed_orders_tx_clone = failed_orders_tx.clone();
                         let pending_orders_clone = pending_orders_clone.clone();
                         let rpc_client_clone = rpc_client_clone.clone();
+                        let tpu_client_clone = tpu_client.clone();
+                        let jito_client_clone = jito_sdk.clone();
                         let wallet_clone = wallet_clone.clone();
                         tokio::spawn(async move {
                             match execute_order(
                                 order.clone(),
                                 wallet_clone,
                                 rpc_client_clone,
-                                &executor_config_clone,
-                                &bloxroute_config_clone,
+                                tpu_client_clone,
+                                jito_client_clone,
+                                &app_config_clone.executor,
+                                &tip_accounts,
                             ).await {
                                 // Emit the executed order to the executed_orders_tx channel
                                 Ok(order) => match executed_orders_tx_clone.send(order.clone()).await {
@@ -265,16 +330,27 @@ async fn execute_order(
     mut order: Order,
     wallet: Arc<Wallet>,
     rpc_client: Arc<RpcClient>,
+    tpu_client: Arc<TpuClient<QuicPool, QuicConnectionManager, QuicConfig>>,
+    jito_client: Arc<JitoJsonRpcSDK>,
     executor_config: &ExecutorConfig,
-    bloxroute_config: &BloxrouteConfig,
+    tip_accounts: &TipAccounts,
 ) -> Result<Order, Box<dyn std::error::Error + Send + Sync>> {
     // Check if the executor is Bloxroute and if it is enabled
-    let bloxroute_enabled = bloxroute_config.enabled && order.executor == ExecutorType::Bloxroute;
     let start_time = Utc::now().time();
 
-    let mut attempts = 0;
+    // We try only once when buy, and retry N times when sell
+    let max_attempts = if order.direction == OrderDirection::QuoteIn { 1 } else { MAX_SELL_RETRIES };
+    let mut send_tx_attempts = 0;
 
-    loop {
+    // Get tip account based on the executor type
+    let tip_account = match order.executor {
+        ExecutorType::Bloxroute => Some(&tip_accounts.bloxroute),
+        ExecutorType::Jito => Some(&tip_accounts.jito),
+        _ => None,
+    };
+
+    // Try to build, send and confirm the transaction until it's successful
+    let signature_string = loop {
         // Get the latest blockhash
         let recent_blockhash = match rpc_client
             .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
@@ -282,157 +358,188 @@ async fn execute_order(
             Ok((blockhash, _)) => blockhash,
             Err(e) => {
                 error!("Failed to get latest blockhash: {}", e);
-                return Err(Box::new(e));
+                continue;
             }
         };
 
-        // Build the unsigned transaction for the order
-        let tx = {
-            // If enabled and create_swap_tx is true, create the swap tx via Bloxroute API
-            if bloxroute_enabled && bloxroute_config.create_swap_tx {
-                match bloxroute::create_swap_tx(&[]).await {
-                    Ok(tx) => tx,
-                    Err(e) => {
-                        error!("Failed to create swap tx via Bloxroute: {}", e);
-                        return Err(e);
-                    }
-                };
-            }
-
-            // Otherwise, build the tx locally. It will include the bribe
-            // transfer instruction if the executor is Bloxroute.
-            match order.direction {
-                OrderDirection::QuoteIn => {
-                    match swap::create_swap_in_tx(
-                        &wallet.keypair,
-                        &order,
-                        &recent_blockhash,
-                        executor_config.compute_unit_limit,
-                        executor_config.compute_unit_price,
-                        bloxroute_enabled,
-                    ).await {
-                        Ok(tx) => tx,
-                        Err(e) => {
-                            error!("Failed to build swap in transaction for order: {}", e);
-                            return Err(e);
-                        }
-                    }
-                }
-                OrderDirection::QuoteOut => {
-                    match swap::create_swap_out_tx(
-                        &wallet.keypair,
-                        &order,
-                        &recent_blockhash,
-                        executor_config.compute_unit_limit,
-                        executor_config.compute_unit_price,
-                        bloxroute_enabled,
-                    ).await {
-                        Ok(tx) => tx,
-                        Err(e) => {
-                            error!("Failed to build swap out transaction for order: {}", e);
-                            return Err(e);
-                        }
-                    }
-                }
-            }
-        };
-
-        // Broadcast the transaction to the blockchain and get the signature
-        let signature = if bloxroute_enabled {
-            // Send signed tx to blockchain via Bloxroute API and wait for confirmation
-            // match bloxroute::send_tx(&tx).await {
-            //     Ok(signature) => signature,
+        // Build transaction via bloxroute API if configured
+        if executor_config.build_tx_via_bloxroute {
+            // match bloxroute::create_swap_tx(&[]).await {
+            //     Ok(tx) => tx,
             //     Err(e) => {
-            //         error!("Failed to send transaction via Bloxroute: {}", e);
-            //         return Err(Box::new(e));
+            //         error!("Failed to create swap tx via Bloxroute: {}", e);
+            //         match handle_attempt(&mut send_tx_attempts, max_attempts, 300).await {
+            //             Ok(_) => continue,
+            //             Err(_) => return Err("Unable to create swap transaction".into()),
+            //         }
             //     }
-            // }
+            // };
+        }
 
-            // Simulate tx confirmation and receipt time (~2000ms / 5 blocks)
-            tokio::time::sleep(Duration::from_millis(2000)).await;
-            tx.signatures[0]
-        } else {
-            // Send and confirm the transaction via RPC client
-            match confirm_and_send_tx(rpc_client.clone(), &tx, &recent_blockhash).await {
-                Ok(signature) => signature,
-                Err(e) => {
-                    error!("Failed to send and confirm transaction: {}", e);
-
-                    // Increment retry attempt counter and handle retry logic
-                    match handle_attempt(&mut attempts, MAX_TX_RETRIES as u32, 300).await {
-                        Ok(_) => continue,
-                        Err(_) => return Err("Transaction details not found".into()),
+        // Otherwise, create tx message manually based on the order direction
+        let message = match order.direction {
+            OrderDirection::QuoteIn => {
+                match swap::create_amm_swap_in(
+                    &wallet.keypair,
+                    &order,
+                    &recent_blockhash,
+                    executor_config.compute_unit_limit,
+                    executor_config.compute_unit_price,
+                    &order.executor,
+                    tip_account,
+                    order.executor_bribe,
+                ).await {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        error!("Failed to build swap in message: {}", e);
+                        continue;
                     }
                 }
             }
-
-            // // Simulate tx confirmation and receipt time (~15000ms / 37 blocks)
-            // tokio::time::sleep(Duration::from_millis(15000)).await;
-            // tx.signatures[0]
-        };
-
-        let signature_string = &signature.to_string();
-
-        // Get the transaction metadata by signature
-        let tx_meta = match solana::get_transaction_metadata(
-            &rpc_client,
-            signature_string,
-        ).await {
-            Ok(meta) => meta,
-            Err(e) => {
-                error!("Failed to fetch confirmed transaction: {}", e);
-
-                // Increment retry attempt counter and handle retry logic
-                match handle_attempt(&mut attempts, MAX_TX_RETRIES as u32, 300).await {
-                    Ok(_) => continue,
-                    Err(_) => return Err("Transaction details not found".into()),
+            OrderDirection::QuoteOut => {
+                match swap::create_amm_swap_out(
+                    &wallet.keypair,
+                    &order,
+                    &recent_blockhash,
+                    executor_config.compute_unit_limit,
+                    executor_config.compute_unit_price,
+                    &order.executor,
+                    tip_account,
+                    order.executor_bribe,
+                ).await {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        error!("Failed to build swap out message: {}", e);
+                        continue;
+                    }
                 }
             }
         };
 
-        // Get compute units consumed
-        let compute_units_consumed = match tx_meta.compute_units_consumed {
-            OptionSerializer::Some(units) => units,
-            _ => 0,
-        };
-
-        // Compute out token address and extract the real amount out from the tx metadata
-        let received_amount = match extract_token_balance_change(
-            &tx_meta,
-            &wallet.pubkey,
-            &order.out_mint,
+        // Sign the message and create the transaction
+        let transaction = match VersionedTransaction::try_new(
+            message,
+            &[&wallet.keypair],
         ) {
-            Some((_, _, amount_change)) => amount_change,
-            None => {
-                error!("Destination token balance change not found in transaction metadata");
-                return Err("Destination token balance change not found".into());
+            Ok(tx) => tx,
+            Err(err) => {
+                error!("Error signing versioned transaction: {:?}", err);
+                continue;
             }
         };
 
-        // Confirm the order with the transaction signature
-        order.confirm(
-            signature_string,
-            received_amount,
-            tx_meta.fee,
-            compute_units_consumed,
-            current_timestamp(),
-        );
+        // If executor is not TPU, send the transaction via RPC or API provider
+        if !executor_config.use_tpu {
+            // If bloxroute is enabled, send the transaction via bloxroute API
+            let signature = if order.executor == ExecutorType::Bloxroute {
+                // Send signed tx to blockchain via Bloxroute API and wait for confirmation
+                // match bloxroute::send_tx(&tx).await {
+                //     Ok(signature) => signature,
+                //     Err(e) => {
+                //         error!("Failed to send transaction via Bloxroute: {}", e);
+                //         return Err(Box::new(e));
+                //     }
+                // }
 
-        info!(
+                // Mock tx confirmation and receipt time (~2000ms / 5 blocks)
+                tokio::time::sleep(Duration::from_millis(2000)).await;
+                transaction.signatures[0]
+            } else {
+                match broadcast_and_confirm_transaction_via_rpc(
+                    rpc_client.clone(),
+                    &transaction,
+                    &recent_blockhash,
+                ).await {
+                    Ok(signature) => signature,
+                    Err(e) => {
+                        error!("Failed to send and confirm transaction via rpc: {}", e);
+                        match handle_attempt(&mut send_tx_attempts, max_attempts, 100).await {
+                            Ok(_) => continue,
+                            Err(_) => return Err(e),
+                        }
+                    }
+                }
+            };
+
+            // Convert the signature to a string and break the loop
+            break signature.to_string();
+        }
+
+        // Otherwise, send transaction via TPU client and wait for confirmation
+        match broadcast_and_confirm_transaction_via_tpu(
+            tpu_client.clone(),
+            &transaction,
+            &recent_blockhash,
+        ).await {
+            Ok(signature) => {
+                // Convert the signature to a string and break the loop
+                break signature.to_string();
+            }
+            Err(e) => {
+                error!("Failed to send and confirm transaction via TPU: {}", e);
+                match handle_attempt(&mut send_tx_attempts, max_attempts, 100).await {
+                    Ok(_) => continue,
+                    Err(_) => return Err(e),
+                }
+            }
+        }
+    };
+
+    // Get the transaction metadata by signature
+    let tx_meta = match solana::get_transaction_metadata(
+        &rpc_client,
+        &signature_string,
+    ).await {
+        Ok(meta) => meta,
+        Err(e) => {
+            error!("Failed to fetch confirmed transaction: {}", e);
+            return Err("Transaction details not found".into());
+        }
+    };
+
+    // Get compute units consumed
+    let compute_units_consumed = match tx_meta.compute_units_consumed {
+        OptionSerializer::Some(units) => units,
+        _ => 0,
+    };
+
+    // Compute out token address and extract the real amount out from the tx metadata
+    let received_amount = match extract_token_balance_change(
+        &tx_meta,
+        &wallet.pubkey,
+        &order.out_mint,
+    ) {
+        Some((_, _, amount_change)) => amount_change,
+        None => {
+            error!("Destination token balance change not found in transaction metadata");
+            return Err("Destination token balance change not found".into());
+        }
+    };
+
+    // Confirm the order with the transaction signature
+    order.confirm(
+        &signature_string,
+        received_amount,
+        tx_meta.fee,
+        compute_units_consumed,
+        current_timestamp(),
+    );
+
+    info!(
         "\n✅ Order Executed!\n\
-         ─────────────────────────────────────────────────────\n\
-         ▶️ Trade ID:        {}\n\
-         ▶️ Pool:            {}\n\
-         ▶️ Tx:              {}\n\
-         ▶️ Status:          {}\n\
-         ▶️ Side:            {:?}\n\
-         ▶️ Amount In:       {:.9}\n\
-         ▶️ Amount Out:      {:.9}\n\
-         ▶️ Fee:             {:.9}\n\
-         ▶️ Compute Units:   {}\n\
-         ▶️ Confirmed At:    {}\n\
-         ▶️ Processed In:    {}ms\n\
-         ▶️ Explorer:        https://solscan.io/tx/{}\n",
+        ─────────────────────────────────────────────────────\n\
+        ▶️ Trade ID:        {}\n\
+        ▶️ Pool:            {}\n\
+        ▶️ Tx:              {}\n\
+        ▶️ Status:          {}\n\
+        ▶️ Side:            {:?}\n\
+        ▶️ Amount In:       {:.9}\n\
+        ▶️ Amount Out:      {:.9}\n\
+        ▶️ Fee:             {:.9}\n\
+        ▶️ Compute Units:   {}\n\
+        ▶️ Confirmed At:    {}\n\
+        ▶️ Processed In:    {}ms\n\
+        ▶️ Explorer:        https://solscan.io/tx/{}\n",
         order.trade_id,
         order.pool_keys.id.to_string(),
         signature_string,
@@ -447,25 +554,27 @@ async fn execute_order(
         signature_string,
     );
 
-        return Ok(order);
-    }
+    Ok(order)
 }
 
-async fn confirm_and_send_tx(
+/// This function will broadcast the transaction to the blockchain and wait for
+/// confirmation. It will use the RPC client.
+async fn broadcast_and_confirm_transaction_via_rpc(
     rpc_client: Arc<RpcClient>,
-    tx: &VersionedTransaction,
+    transaction: &VersionedTransaction,
     recent_blockhash: &Hash,
 ) -> Result<Signature, Box<dyn std::error::Error + Send + Sync>> {
-    // Send tx via RPC client and wait for confirmation
-    let signature = match rpc_client
-        .send_transaction_with_config(tx, RpcSendTransactionConfig {
+    // Send the transaction to the blockchain
+    let signature = match rpc_client.send_transaction_with_config(
+        transaction,
+        RpcSendTransactionConfig {
             encoding: Some(UiTransactionEncoding::Base64),
             skip_preflight: true, // Skip preflight checks for faster execution
             max_retries: Some(0), // Do not retry on failure here
             preflight_commitment: Some(CommitmentLevel::Confirmed),
             min_context_slot: None,
-        })
-        .await {
+        },
+    ).await {
         Ok(signature) => signature,
         Err(e) => {
             error!("Failed to send transaction: {}", e);
@@ -473,6 +582,7 @@ async fn confirm_and_send_tx(
         }
     };
 
+    // Wait for the transaction to be confirmed.
     match rpc_client.confirm_transaction_with_spinner(
         &signature,
         recent_blockhash,
@@ -480,11 +590,50 @@ async fn confirm_and_send_tx(
     ).await {
         Ok(_) => Ok(signature),
         Err(e) => {
-            error!("Failed to confirm transaction: {}", e);
+            error!("Failed to confirm transaction sent via RPC: {}", e);
             Err(Box::new(e))
         }
     }
 }
+
+/// This function will broadcast the transaction to the blockchain and wait for
+/// confirmation. It will use the TPU client.
+pub async fn broadcast_and_confirm_transaction_via_tpu(
+    tpu_client: Arc<TpuClient<QuicPool, QuicConnectionManager, QuicConfig>>,
+    transaction: &VersionedTransaction,
+    recent_blockhash: &Hash,
+) -> Result<Signature, Box<dyn std::error::Error + Send + Sync>> {
+    // Serialize the versioned transaction to bytes
+    let serialized_tx = match bincode::serialize(&transaction) {
+        Ok(tx) => tx,
+        Err(e) => {
+            error!("Failed to serialize versioned transaction: {}", e);
+            return Err(Box::new(e));
+        }
+    };
+
+    // Send the transaction to the leader via TPU
+    let result = tpu_client.send_wire_transaction(serialized_tx).await;
+    if !result {
+        // If the transaction failed to send via TPU, return an error
+        return Err("Failed to send transaction via TPU".into());
+    }
+
+    // If transaction was sent successfully, wait for confirmation via RPC
+    let signature = transaction.get_signature();
+    match tpu_client.rpc_client().confirm_transaction_with_spinner(
+        signature,
+        recent_blockhash,
+        CommitmentConfig::confirmed(),
+    ).await {
+        Ok(_) => Ok(*signature),
+        Err(e) => {
+            error!("Failed to confirm transaction sent via TPU: {}", e);
+            Err(Box::new(e))
+        }
+    }
+}
+
 
 fn get_delay_duration(delay: u64, delayed_at: u64) -> Duration {
     let now = Utc::now().timestamp() as u64;

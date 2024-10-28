@@ -6,15 +6,9 @@ rpc:
   ws_url: "wss://api.mainnet-beta.solana.com"
 
 bloxroute:
-  # If enabled, the bot will use Bloxroute to broadcast
-  # transactions to speed up the transaction propagation.
+  # If enabled, the bot will use Bloxroute to subscribe to account updates
+  # and sending transactions if bloxroute is set as the executor.
   enabled: false
-  
-  # Configure how the bot will create the swap transactions.
-  # By default, the unsigned tx will be created by the bot,
-  # but if you enable this option Bloxroute will create the
-  # unsigned tx for signing.
-  create_swap_tx: true
 
   # Bloxroute URL and WebSocket URL.
   url: "https://uk.solana.dex.blxrbdn.com"
@@ -22,6 +16,10 @@ bloxroute:
 
   # Auth token is required when using Bloxroute.
   auth_token: ""
+
+jito:
+  enabled: false
+  url: "https://mainnet.block-engine.jito.wtf"
 
 # Wallet configuration
 wallet:
@@ -32,7 +30,7 @@ wallet:
 
   # Path to the wallet file. If you are using a wallet file, you can
   # specify the path to the file here.
-  file_path: "/Users/25x8/.config/solana/id.json"
+  file_path: "/path/to/your/wallet.json"
 
   # Wallet secret key. If you are using a wallet secret key, you can
   # specify the key here.
@@ -44,17 +42,15 @@ detector:
   # If the watchlist is empty, the bot will focus on all tokens.
   # Otherwise, the bot will process only tokens from the watchlist.
   watchlist: []
-#   watchlist:
-#     - "Dyg9HthwdkenToccZQM76TjWFoqSPfQd5d8iR8vspump"
-#     - "7tGAa9otm4Qmmd9Di1PQJCyyZz1Wh78drpH2TiaTEb5G"
-#     - "Bk6btMamZ2UiUdgxApy5w9iBRU9JY1Kr3T1Zgbae5jZw"
-#     - "7D7BRcBYepfi77vxySapmeqRNN1wsBBxnFPJGbH5pump"
+#  watchlist:
+#    - "ARLgQYUjeMTfjAbpEMGK8GXFKTapXQJRQdQcbtawfZEa"
+#    - "8J7UhkUautkuoMSH3z1tAUwqYKnC91F8ZQYtatSWa7nQ"
 
 # Trader module configuration
 trader:
   # If enabled, the bot will close all open trades on shutdown by current price.
   close_trades_on_shutdown: true
-  
+
   # List of conditions that can be used to choose the strategy.
   # Any condition with a value of 0 or commented out will be ignored.
   strategies:
@@ -145,21 +141,38 @@ trader:
       buy_delay: 0 # Delay in milliseconds before executing the buy order.
       sell_delay: 0
       buy_slippage: 10.0 # Maximum slippage allowed for the buy order.
-      sell_slippage: 50.0
-      buy_executor: "bloxroute" # Tx executor, can be "rpc" or "bloxroute".
-      max_retries: 5 # Number of retries if the buy order fails.
-      quote_amount: 0.21 # Amount of quote currency to spend.
+      sell_slippage: 0.0
+      buy_executor: "jito" # Tx executor, can be "rpc" or "bloxroute".
+      max_retries: 5 # Number of retries if the buy/sell order fails.
+      quote_amount: 0.03 # Amount of quote currency to spend.
       sell_percent: 100.0 # Percentage of the base currency to sell.
+
+      # Price impact percentage is impact of swap upon the pool's liquidity.
+      # If impact is greater than the max_price_impact, the bot will not trade.
+      # Zero means any price impact is allowed.
+      max_price_impact: 0.0
 
       # After holding the token for the hold_time, the bot will
       # execute the sell order automatically by current price.
-      hold_time: 300000 # Hold time in milliseconds.
-      take_profit: 25.0 # Take profit percentage.
-      stop_loss: 10.0 # Stop loss percentage.
-      take_profit_executor: "rpc"
-      stop_loss_executor: "bloxroute"
+      hold_time: 60000 # Hold time in milliseconds.
+      take_profit: 35.0 # Take profit percentage.
+      stop_loss: 50.0 # Stop loss percentage.
+      take_profit_executor: "jito"
+      stop_loss_executor: "jito"
 
       # The bribes are used to incentivize the validators to include the transaction
       # in the block. It will be used only if Bloxroute is enabled and auth token is provided.
+      # It is recommended to use a 70/30 split between priority fee and jito tip
       buy_bribe: 0.003 # The bribe amount in SOL.
       sell_bribe: 0.003
+
+executor:
+  # If enabled, the bot will use the TPU client to send transactions directly to leader.
+  use_tpu: false
+
+  # Bot will build the transaction via bloxroute API if enabled.
+  build_tx_via_bloxroute: false
+
+  # Settings for tx fees and limits.
+  compute_unit_limit: 90000 # The maximum unit limit for the transaction.
+  compute_unit_price: 7000000 # In lamports.

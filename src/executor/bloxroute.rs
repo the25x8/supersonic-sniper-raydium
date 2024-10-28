@@ -1,53 +1,120 @@
-use base64::Engine;
-use log::error;
 use reqwest::Client;
-use serde_json::json;
-use solana_sdk::transaction::Transaction;
+use serde::{Deserialize, Serialize};
+use solana_sdk::{
+    transaction::VersionedTransaction,
+};
+use base64;
+use base64::Engine;
 
-/// Send swap details to Bloxroute API and return the unsigned transaction.
-pub async fn create_swap_tx(
-    serialized_tx: &[u8],
-) -> Result<Transaction, Box<dyn std::error::Error + Send + Sync>> {
-    let client = Client::new();
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SwapRequest {
+    owner_address: String,
+    in_token: String,
+    out_token: String,
+    in_amount: f64,
+    slippage: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_price: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tip: Option<u64>,
+}
 
-    // Return mock transaction for testing
-    let mock_tx = Transaction::default();
-    return Ok(mock_tx);
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SwapResponse {
+    transactions: Vec<TransactionMessage>,
+    out_amount: f64,
+    out_amount_min: f64,
+    price_impact: PriceImpactV2,
+    fee: Vec<Fee>,
+}
 
-    // Bloxroute API endpoint
-    let api_url = "https://uk.solana.dex.blxrbdn.com/api/v2/raydium/swap";
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TransactionMessage {
+    content: String, // Base64 encoded transaction
+    is_cleanup: bool,
+}
 
-    // Prepare the request payload
-    let payload = json!({
-        "transaction": base64::prelude::BASE64_STANDARD.encode(serialized_tx),
-    });
+#[derive(Deserialize)]
+struct PriceImpactV2 {
+    percent: f64,
+    infinity: String, // "INF_NOT", etc.
+}
+
+#[derive(Deserialize)]
+struct Fee {
+    amount: f64,
+    mint: String,
+    percent: f64,
+}
+
+pub async fn create_amm_swap_tx(
+    http_client: Client,
+    api_host: &str,
+    auth_header: &str,
+    owner_address: &str,
+    in_token: &str,
+    out_token: &str,
+    in_amount: f64,
+    slippage: f64,
+    compute_limit: Option<u32>,
+    compute_price: Option<u64>,
+    tip: Option<u64>,
+) -> Result<VersionedTransaction, Box<dyn std::error::Error + Send + Sync>> {
+    // Build the request body
+    let swap_request = SwapRequest {
+        in_amount,
+        slippage,
+        tip,
+        compute_limit,
+        compute_price,
+        owner_address: owner_address.to_string(),
+        in_token: in_token.to_string(),
+        out_token: out_token.to_string(),
+    };
+
+    // API endpoint URL
+    let url = format!("{}/api/v2/raydium/swap", api_host);
 
     // Send the POST request
-    let response = client
-        .post(api_url)
-        .json(&payload)
+    let response = http_client
+        .post(url)
+        .header("Authorization", auth_header)
+        .header("Content-Type", "application/json")
+        .json(&swap_request)
         .send()
         .await?;
 
-    // Check the response
-    if response.status().is_success() {
-        let response_json: serde_json::Value = response.json().await?;
-        // Assuming the response contains the unsigned transaction as a base64 string
-        if let Some(tx_str) = response_json
-            .get("transactions")
-            .and_then(|r| r.get(0))
-            .and_then(|r| r.get("content"))
-            .and_then(|s| s.as_str()) {
-            let tx_bytes = base64::prelude::BASE64_STANDARD.decode(tx_str)?;
-            let tx: Transaction = serde_json::from_slice(&tx_bytes)?;
-            error!("Swap tx created via Bloxroute.");
-            Ok(tx)
-        } else {
-            Err("Failed to get unsigned transaction from Bloxroute response".into())
-        }
-    } else {
+    // Check if the response status is success
+    if !response.status().is_success() {
+        let status = response.status();
         let error_text = response.text().await?;
-        error!("Unable to submit transaction via Bloxroute: {}", error_text);
-        Err("Failed to submit transaction via Bloxroute".into())
+        return Err(format!(
+            "HTTP request failed with status {}: {}",
+            status, error_text
+        )
+            .into());
     }
+
+    // Parse the response JSON
+    let swap_response: SwapResponse = response.json().await?;
+
+    // Extract the first transaction from the transactions array
+    let tx_message = swap_response
+        .transactions
+        .get(0)
+        .ok_or("No transactions returned in response")?;
+
+    // Decode the base64 transaction content
+    let tx_bytes = base64::prelude::BASE64_STANDARD.decode(&tx_message.content)?;
+
+    // Deserialize the transaction bytes into a VersionedTransaction
+    let versioned_tx: VersionedTransaction = bincode::deserialize(&tx_bytes)?;
+
+    // Return the transaction
+    Ok(versioned_tx)
 }

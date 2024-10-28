@@ -8,14 +8,16 @@ use chrono::TimeZone;
 use dashmap::DashMap;
 use log::{debug, error, info, warn};
 use solana_client::nonblocking::rpc_client::RpcClient;
-use tokio::sync::mpsc::Receiver;
+use solana_program::native_token::sol_to_lamports;
+use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use crate::config::{AppConfig, BloxrouteConfig, ExecutorConfig, ExecutorType, StrategyConfig};
-use crate::detector::{Pool};
+use crate::config::{AppConfig, ExecutorType, StrategyConfig};
+use crate::detector::{AMMPool};
 use crate::solana::quote_mint::USDC_MINT;
 use crate::executor::Executor;
 use crate::executor::order::{Order, OrderDirection, OrderKind, OrderStatus};
-use crate::{solana};
+use crate::market;
 use crate::market::monitor::{MarketData, MarketMonitor};
 use crate::trader::backup::Backup;
 use crate::trader::trade::{Trade, TradeExchange};
@@ -27,7 +29,7 @@ use crate::wallet::Wallet;
 /// selling strategies.
 
 pub struct ChooseStrategyParams {
-    pub pool: Pool,
+    pub pool: AMMPool,
     pub freezable: bool,
     pub mint_renounced: bool,
     pub meta_mutable: bool,
@@ -42,7 +44,7 @@ pub struct Trader {
     wallet: Arc<Wallet>,
     config: Arc<AppConfig>,
     backup: Arc<Backup>,
-    pool_rx: Receiver<Pool>,
+    pool_rx: mpsc::Receiver<AMMPool>,
 
     // Hashmap storing the trades with the pool address as the key
     active_trades: Arc<DashMap<Pubkey, Vec<Trade>>>,
@@ -55,9 +57,9 @@ impl Trader {
     /// Creates a new instance of the Trader module.
     pub async fn new(
         config: Arc<AppConfig>,
-        client: Arc<RpcClient>,
+        rpc_client: Arc<RpcClient>,
         wallet: Arc<Wallet>,
-        pool_rx: Receiver<Pool>,
+        pool_rx: mpsc::Receiver<AMMPool>,
         ws_url: &str,
         cancel_token: CancellationToken,
     ) -> Self {
@@ -78,23 +80,23 @@ impl Trader {
         });
 
         // Initialize the market monitor module
-        let (market_tx, market_rx) = tokio::sync::mpsc::channel(100);
+        let (market_tx, market_rx) = tokio::sync::broadcast::channel(100);
         let market_monitor = Arc::new(MarketMonitor::new(
-            client.clone(),
+            rpc_client.clone(),
             ws_url,
             market_tx,
+            &config.bloxroute,
             cancel_token.clone(),
         ).await);
 
         // The order executor module
         let executor = Self::start_executor(
-            client.clone(),
+            rpc_client.clone(),
             wallet.clone(),
             active_trades.clone(),
             market_monitor.clone(),
             backup.clone(),
-            &config.executor,
-            &config.bloxroute,
+            &config,
             cancel_token.clone(),
         ).await;
 
@@ -107,7 +109,7 @@ impl Trader {
         ).await;
 
         Self {
-            client,
+            client: rpc_client,
             wallet,
             config,
             pool_rx,
@@ -144,25 +146,23 @@ impl Trader {
     /// The executor listens for executed orders (buy/sell) after they
     /// confirmed in the blockchain and processes them accordingly.
     async fn start_executor(
-        client: Arc<RpcClient>,
+        rpc_client: Arc<RpcClient>,
         wallet: Arc<Wallet>,
         active_trades: Arc<DashMap<Pubkey, Vec<Trade>>>,
         market_monitor: Arc<MarketMonitor>,
         backup: Arc<Backup>,
-        executor_config: &ExecutorConfig,
-        bloxroute_config: &BloxrouteConfig,
+        app_config: &AppConfig,
         cancel_token: CancellationToken,
     ) -> Arc<Executor> {
         // Initialize the executor module and get the arc reference
         let (executed_orders_tx, mut executed_orders_rx) = tokio::sync::mpsc::channel(30);
         let (failed_orders_tx, mut failed_orders_rx) = tokio::sync::mpsc::channel(30);
         let executor = Arc::new(Executor::new(
-            client.clone(),
+            rpc_client.clone(),
             wallet.clone(),
             executed_orders_tx,
             failed_orders_tx,
-            executor_config,
-            bloxroute_config,
+            app_config,
             cancel_token,
         ).await);
 
@@ -229,7 +229,7 @@ impl Trader {
 
                 // If the trade was updated as failed, save it to the history
                 if trade_copy.is_some() {
-                    market_monitor.remove_from_watchlist(&pool_pubkey).await;
+                    market_monitor.remove_from_watchlist(&pool_pubkey);
                     backup.save_trade_in_history(trade_copy.unwrap()).await;
                 }
             }
@@ -244,18 +244,27 @@ impl Trader {
         market_monitor: Arc<MarketMonitor>,
         executor: Arc<Executor>,
         active_trades: Arc<DashMap<Pubkey, Vec<Trade>>>,
-        mut market_data_rx: Receiver<MarketData>,
+        mut market_data_rx: broadcast::Receiver<MarketData>,
     ) {
         // Collect the initial pools to be added to the watchlist
         for pool_trades in active_trades.iter() {
-            let pool_keys = &pool_trades.value()[0].pool_keys;
-            market_monitor.add_to_watchlist(pool_trades.key(), pool_keys).await;
+            let trade = &pool_trades.value()[0];
+            market_monitor.add_to_watchlist(pool_trades.key(), market::monitor::PoolMeta {
+                keys: trade.pool_keys.clone(),
+                base_decimals: trade.base_decimals,
+                quote_decimals: trade.quote_decimals,
+            });
         }
+
+        // Run market monitor in a separate task
+        tokio::spawn(async move {
+            market_monitor.start().await;
+        });
 
         // Subscribe to market data updates and process them
         let active_trades = active_trades.clone();
         tokio::spawn(async move {
-            while let Some(market_data) = market_data_rx.recv().await {
+            while let Ok(market_data) = market_data_rx.recv().await {
                 // Process the trades for the current market
                 if let Some(trades_list) = active_trades.get(&market_data.pool) {
                     for trade in trades_list.iter() {
@@ -579,7 +588,11 @@ impl Trader {
 
                 // If you take profit or stop loss is set, add the pool to the watchlist
                 if trade.strategy.take_profit > 0.0 || trade.strategy.stop_loss > 0.0 {
-                    market_monitor.add_to_watchlist(&pool_pubkey, &trade.pool_keys).await;
+                    market_monitor.add_to_watchlist(&pool_pubkey, market::monitor::PoolMeta {
+                        keys: trade.pool_keys.clone(),
+                        base_decimals: trade.base_decimals,
+                        quote_decimals: trade.quote_decimals,
+                    });
                 }
             }
 
@@ -650,7 +663,7 @@ impl Trader {
                         // and remove pool from the watchlist.
                         if is_empty {
                             trades.remove(&pool_pubkey);
-                            market_monitor.remove_from_watchlist(&pool_pubkey).await;
+                            market_monitor.remove_from_watchlist(&pool_pubkey);
                         }
 
                         // If it was not a hold time order, call the executor
@@ -676,7 +689,7 @@ impl Trader {
 
     /// Determines the best strategy to use based on the pool data and the trader configuration.
     /// Creates a new active trade and schedules the buy order if a strategy is chosen.
-    async fn process_detected_pool(&self, pool: Pool, executor: Arc<Executor>) {
+    async fn process_detected_pool(&self, pool: AMMPool, executor: Arc<Executor>) {
         let start_time = chrono::Utc::now().time();
         let wallet = self.wallet.clone(); // Clone the wallet to use in tasks
         let config = self.config.clone(); // Clone the config to use in tasks
@@ -825,10 +838,7 @@ impl Trader {
 
         let raw_amount_in = spl_token::ui_amount_to_amount(amount_in, in_decimals);
         let raw_min_amount_out = spl_token::ui_amount_to_amount(min_amount_out, out_decimals);
-        let bloxroute_bribe = spl_token::ui_amount_to_amount(
-            trade.strategy.buy_bribe.unwrap_or(0.0),
-            in_decimals,
-        );
+        let executor_bribe = sol_to_lamports(trade.strategy.buy_bribe.unwrap_or(0.0));
 
         let buy_order = Order::new(
             OrderDirection::QuoteIn,
@@ -847,7 +857,7 @@ impl Trader {
             } else {
                 ExecutorType::RPC
             },
-            bloxroute_bribe,
+            executor_bribe,
             trade.strategy.buy_delay,
         );
 
@@ -883,7 +893,7 @@ impl Trader {
     fn choose_strategy(strategies: &HashMap<String, StrategyConfig>, params: ChooseStrategyParams) -> Result<(String, StrategyConfig), ()> {
         // Check that strategies are defined in the config
         if strategies.is_empty() {
-            error!("No strategies defined in the configuration");
+            warn!("No strategies defined in the configuration");
             return Err(());
         }
 
@@ -891,19 +901,19 @@ impl Trader {
         for (name, strategy) in strategies.iter() {
             // Check should the token be freezable
             if strategy.freezable != params.freezable {
-                error!("Freezable condition not met");
+                warn!("Freezable condition not met");
                 continue;
             }
 
             // Can the mint authority mint new tokens
             if strategy.mint_renounced != params.mint_renounced {
-                error!("Mint renounced condition not met");
+                warn!("Mint renounced condition not met");
                 continue;
             }
 
             // Can the metadata be changed
             if strategy.meta_mutable.is_some() && strategy.meta_mutable.unwrap() != params.meta_mutable {
-                error!("Metadata mutable condition not met");
+                warn!("Metadata mutable condition not met");
                 continue;
             }
 
@@ -916,7 +926,7 @@ impl Trader {
                     (quote_symbol == "USDC" &&
                         params.pool.keys.quote_mint.to_string() != USDC_MINT &&
                         params.pool.keys.base_mint.to_string() != USDC_MINT) {
-                    error!("Quote symbol condition not met");
+                    warn!("Quote symbol condition not met");
                     continue;
                 }
             }
@@ -925,7 +935,7 @@ impl Trader {
             if params.pool.open_time.timestamp() > 0 {
                 let elapsed = chrono::Utc::now() - params.pool.timestamp;
                 if elapsed.num_milliseconds() > strategy.max_delay_since_detect as i64 {
-                    error!("Max delay since open condition not met. {}, {}, {}",
+                    warn!("Max delay since open condition not met. {}, {}, {}",
                         params.pool.open_time.timestamp_millis(),
                         elapsed.num_milliseconds(),
                         strategy.max_delay_since_detect,
@@ -943,7 +953,7 @@ impl Trader {
                 strategy.price,
                 strategy.price_range.clone(),
             ) {
-                error!("Price condition not met");
+                warn!("Price condition not met");
                 continue;
             }
 
@@ -954,7 +964,7 @@ impl Trader {
                 Some(strategy.reserves_quote.unwrap_or(0.0)),
                 strategy.reserves_quote_range.clone(),
             ) {
-                error!("Quote reserves condition not met");
+                warn!("Quote reserves condition not met");
                 continue;
             }
 
@@ -964,7 +974,7 @@ impl Trader {
                 Some(strategy.reserves_base.unwrap_or(0.0)),
                 strategy.reserves_base_range.clone(),
             ) {
-                error!("Base reserves condition not met");
+                warn!("Base reserves condition not met");
                 continue;
             }
 
@@ -975,7 +985,7 @@ impl Trader {
                 Some(strategy.total_supply.unwrap_or(0.0)),
                 strategy.total_supply_range.clone(),
             ) {
-                error!("Base supply condition not met");
+                warn!("Base supply condition not met");
                 continue;
             }
 

@@ -2,13 +2,12 @@ use std::error::Error;
 use std::sync::Arc;
 use borsh::BorshDeserialize;
 use serde::{Deserialize, Serialize};
-use log::{error, info};
+use log::error;
 use solana_account_decoder::parse_token::UiTokenAmount;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_program::program_pack::Pack;
 use solana_program::pubkey::Pubkey;
 use spl_token::state::Mint;
-use crate::detector::PoolKeys;
 use crate::error::handle_attempt;
 
 const MAX_FETCH_RETRIES: u32 = 3;
@@ -249,7 +248,7 @@ pub async fn check_liquidity(
     rpc_client: Arc<RpcClient>,
 ) -> Result<LiquidityCheckResult, Box<dyn Error + Send + Sync>> {
     // Fetch mint account info for lp_mint
-    let mint_account_info = rpc_client.get_account(&lp_mint).await?;
+    let mint_account_info = rpc_client.get_account(lp_mint).await?;
     let mint_data = mint_account_info.data;
 
     // Parse the mint account data
@@ -260,7 +259,7 @@ pub async fn check_liquidity(
     let supply = mint_info.supply;
 
     // Calculate lp_reserve / 10^decimals
-    lp_reserve = lp_reserve / 10u64.pow(decimals as u32) as f64;
+    lp_reserve /= 10u64.pow(decimals as u32) as f64;
 
     // Calculate actualSupply
     let actual_supply = supply as f64 / 10u64.pow(decimals as u32) as f64;

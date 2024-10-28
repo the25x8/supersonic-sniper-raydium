@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct AppConfig {
     pub rpc: RPCConfig,
     pub bloxroute: BloxrouteConfig,
+    pub jito: JitoConfig,
     pub wallet: WalletConfig,
     pub detector: DetectorConfig,
     pub trader: TraderConfig,
@@ -22,19 +23,19 @@ pub struct RPCConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct BloxrouteConfig {
-    // If enabled, the bot will use Bloxroute to broadcast
-    // transactions to speed up the transaction propagation.
+    // If enabled, the bot will use Bloxroute to subscribe to account updates
+    // and sending transactions if bloxroute is set as the executor.
     pub enabled: bool,
-
-    // Configure how the bot will create the swap transactions.
-    // By default, the unsigned tx will be created by the bot,
-    // but if you enable this option Bloxroute will create the
-    // unsigned tx for signing.
-    pub create_swap_tx: bool,
 
     pub url: Option<String>,
     pub ws_url: Option<String>,
     pub auth_token: Option<String>, // Auth token is required when using Bloxroute.
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct JitoConfig {
+    pub enabled: bool,
+    pub url: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -158,6 +159,11 @@ pub struct StrategyConfig {
     pub sell_slippage: f64,
     pub sell_percent: f64, // Percentage of the base currency to sell.
 
+    // Price impact percentage is impact of swap upon the pool's liquidity.
+    // If impact is greater than the max_price_impact, the bot will not trade.
+    // Zero means any price impact is allowed.
+    pub max_price_impact: f64,
+
     pub max_retries: u8, // Number of retries if the buy order fails.
     pub quote_amount: f64, // Amount of quote currency to spend on the buy order.
 
@@ -174,6 +180,7 @@ pub struct StrategyConfig {
 
     // The bribes are used to incentivize the validators to include the transaction
     // in the block. It will be used only if Bloxroute is enabled and auth token is provided.
+    // It is recommended to use a 70/30 split between priority fee and jito tip
     pub buy_bribe: Option<f64>, // Amount in SOL
     pub sell_bribe: Option<f64>, // Amount in SOL
 }
@@ -182,13 +189,15 @@ pub struct StrategyConfig {
 pub enum ExecutorType {
     RPC,
     Bloxroute,
+    Jito,
 }
 
 impl ExecutorType {
     fn as_str(&self) -> &'static str {
         match self {
             ExecutorType::RPC => "rpc",
-            ExecutorType::Bloxroute => "bloxroute"
+            ExecutorType::Bloxroute => "bloxroute",
+            ExecutorType::Jito => "jito",
         }
     }
 
@@ -196,6 +205,7 @@ impl ExecutorType {
         match s {
             "rpc" => Some(ExecutorType::RPC),
             "bloxroute" => Some(ExecutorType::Bloxroute),
+            "jito" => Some(ExecutorType::Jito),
             _ => None
         }
     }
@@ -203,8 +213,15 @@ impl ExecutorType {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ExecutorConfig {
-    pub compute_unit_limit: u32,
-    pub compute_unit_price: u64,
+    // If enabled, the bot will use the TPU client to send transactions directly to leader.
+    pub use_tpu: bool,
+
+    // Bot will build the transaction via bloxroute API if enabled.
+    pub build_tx_via_bloxroute: bool,
+
+    // Settings for tx fees and limits.
+    pub compute_unit_limit: u32, // The maximum unit limit for the transaction
+    pub compute_unit_price: u64, // In lamports
 }
 
 /// Loads the application configuration from a specified file and overlays it with environment variables.

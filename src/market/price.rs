@@ -24,6 +24,23 @@ pub fn convert_reserves_to_price(
     Ok(price)
 }
 
+/// The same as convert_reserves_to_price, but takes raw reserves as f64 and their decimals.
+pub fn convert_raw_reserves_to_price(
+    base_mint: Pubkey,
+    quote_mint: Pubkey,
+    base_reserves: f64,
+    base_decimals: u8,
+    quote_reserves: f64,
+    quote_decimals: u8,
+) -> f64 {
+    // Adjust the reserves for token decimals
+    let base_reserves = base_reserves / 10f64.powi(base_decimals as i32);
+    let quote_reserves = quote_reserves / 10f64.powi(quote_decimals as i32);
+
+    // Calculate price using the correct reserve amounts
+    adjust_tokens_and_calculate_price(base_mint, quote_mint, base_reserves, quote_reserves)
+}
+
 pub fn adjust_tokens_and_calculate_price(
     mut base_mint: Pubkey,
     mut quote_mint: Pubkey,
@@ -39,7 +56,7 @@ pub fn adjust_tokens_and_calculate_price(
 
     // Now, quote token is WSOL/USDC
     // Calculate the price
-    
+
 
     quote_reserves / base_reserves
 }

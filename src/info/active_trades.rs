@@ -60,7 +60,7 @@ fn get_active_trades_header() -> String {
 
 fn format_active_trade_row(trade: &Trade) -> String {
     let created_at = Utc
-        .timestamp_opt((trade.created_at / 1000) as i64, 0)
+        .timestamp_opt(trade.created_at as i64, 0)
         .unwrap()
         .to_rfc3339();
 

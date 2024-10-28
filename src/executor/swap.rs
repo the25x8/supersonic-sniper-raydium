@@ -1,28 +1,33 @@
 use std::str::FromStr;
+use log::error;
 use solana_program::instruction::Instruction;
 use solana_program::pubkey::Pubkey;
 use solana_program::system_instruction;
 use spl_associated_token_account::{get_associated_token_address, instruction as ata_instruction};
 use solana_program::hash::Hash;
+use solana_program::message::{v0, VersionedMessage};
+use solana_program::native_token::sol_to_lamports;
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::signature::{Keypair, Signer};
-use solana_sdk::transaction::{VersionedTransaction};
 use crate::config::ExecutorType;
+use crate::executor::executor::TipAccounts;
 use crate::executor::order::Order;
 use crate::raydium::{build_swap_in_instruction};
 use crate::solana;
 
-const BLOXROUTE_BRIBE_ADDRESS: &str = "HWEoBxYs7ssKuudEjzjmpfJVX7Dvi7wescFsVx2L5yoY";
+const BLOXROUTE_TIP_ACCOUNT: &str = "HWEoBxYs7ssKuudEjzjmpfJVX7Dvi7wescFsVx2L5yoY";
 
-/// Builds a transaction to swap tokens in on the Raydium AMM.
-pub async fn create_swap_in_tx(
+/// Builds a message to swap tokens in on the Raydium AMM.
+pub async fn create_amm_swap_in(
     payer: &Keypair,
     order: &Order,
     recent_blockhash: &Hash,
     compute_unit_limit: u32,
     compute_unit_price: u64,
-    bloxroute_enabled: bool,
-) -> Result<VersionedTransaction, Box<dyn std::error::Error + Send + Sync>> {
+    executor: &ExecutorType,
+    tip_account: Option<&Pubkey>,
+    tip_amount: u64, // lamports
+) -> Result<VersionedMessage, Box<dyn std::error::Error + Send + Sync>> {
     let payer_pubkey = payer.pubkey();
 
     // User token source is the associated token account for the quote currency
@@ -68,14 +73,19 @@ pub async fn create_swap_in_tx(
         swap_instruction,
     ];
 
-    // Include a bribe transfer instruction if order executor is a bloxroute.
-    // Only if bloxroute feature is enabled.
-    if bloxroute_enabled {
-        instructions.push(add_bloxroute_bribe(
-            payer,
-            order.executor.clone(),
-            order.executor_bribe,
-        )?);
+    // If order executor isn't RPC add bribe transfer instruction
+    if *executor != ExecutorType::RPC {
+        // Check if tip account and amount are provided
+        if tip_account.is_none() || tip_amount == 0 {
+            error!("Tip account and amount must be provided for bribe transactions");
+            return Err("Tip account and amount must be provided for bribe transactions".into());
+        }
+
+        instructions.push(system_instruction::transfer(
+            &payer.pubkey(),
+            tip_account.unwrap(),
+            tip_amount,
+        ));
     }
 
     // let raw_account = client.get_account(&address_lookup_table_key)?;
@@ -85,26 +95,34 @@ pub async fn create_swap_in_tx(
     //     addresses: address_lookup_table.addresses.to_vec(),
     // };
 
-    // Create and sign v0 tx
-    let tx = match solana::create_tx(payer, instructions, recent_blockhash) {
-        Ok(tx) => tx,
+    // Build v0 message
+    let message = match v0::Message::try_compile(
+        &payer.pubkey(),
+        &instructions,
+        &[],
+        *recent_blockhash,
+    ) {
+        Ok(message) => message,
         Err(err) => {
-            return Err(err)
+            error!("Error compiling swap in v0 message: {:?}", err);
+            return Err(err.into());
         }
     };
 
-    Ok(tx)
+    Ok(VersionedMessage::V0(message))
 }
 
-/// Builds a transaction to swap tokens out on the Raydium AMM.
-pub async fn create_swap_out_tx(
+/// Builds a message to swap tokens out on the Raydium AMM.
+pub async fn create_amm_swap_out(
     payer: &Keypair,
     order: &Order,
     recent_blockhash: &Hash,
     compute_unit_limit: u32,
     compute_unit_price: u64,
-    bloxroute_enabled: bool,
-) -> Result<VersionedTransaction, Box<dyn std::error::Error + Send + Sync>> {
+    executor: &ExecutorType,
+    tip_account: Option<&Pubkey>,
+    tip_amount: u64, // lamports
+) -> Result<VersionedMessage, Box<dyn std::error::Error + Send + Sync>> {
     let payer_pubkey = payer.pubkey();
 
     // User token source is the associated token account for the quote currency
@@ -153,50 +171,34 @@ pub async fn create_swap_out_tx(
         close_account_ix,
     ];
 
-    // Include a bribe transfer instruction if order executor is a bloxroute.
-    // Only if bloxroute feature is enabled.
-    if bloxroute_enabled {
-        instructions.push(add_bloxroute_bribe(
-            payer,
-            order.executor.clone(),
-            order.executor_bribe,
-        )?);
+    // If order executor isn't RPC add bribe transfer instruction
+    if *executor != ExecutorType::RPC {
+        // Check if tip account and amount are provided
+        if tip_account.is_none() || tip_amount == 0 {
+            error!("Tip account and amount must be provided for bribe transactions");
+            return Err("Tip account and amount must be provided for bribe transactions".into());
+        }
+
+        instructions.push(system_instruction::transfer(
+            &payer.pubkey(),
+            tip_account.unwrap(),
+            tip_amount,
+        ));
     }
 
-    // Create and sign v0 tx
-    let tx = match solana::create_tx(payer, instructions, recent_blockhash) {
-        Ok(tx) => tx,
+    // Build v0 message
+    let message = match v0::Message::try_compile(
+        &payer.pubkey(),
+        &instructions,
+        &[],
+        *recent_blockhash,
+    ) {
+        Ok(message) => message,
         Err(err) => {
-            return Err(err)
+            error!("Error compiling swap out v0 message: {:?}", err);
+            return Err(err.into());
         }
     };
 
-    Ok(tx)
-}
-
-/// Adds a bribe transfer instruction to the transaction if the executor is Bloxroute.
-fn add_bloxroute_bribe(
-    payer: &Keypair,
-    executor: ExecutorType,
-    bribe_amount: u64,
-) -> Result<Instruction, Box<dyn std::error::Error + Send + Sync>> {
-    // Only add bribe transfer instruction if executor is Bloxroute
-    if executor != ExecutorType::Bloxroute {
-        return Err("Executor is not Bloxroute".into());
-    }
-
-    // If bribe amount is not provided or is zero, return early
-    if bribe_amount == 0 {
-        return Err("Bloxroute bribe amount cannot be zero if executor is Bloxroute".into());
-    }
-
-    // Include a bribe transfer instruction if order executor is a bloxroute.
-    let bloxroute_wallet = Pubkey::from_str(BLOXROUTE_BRIBE_ADDRESS)?;
-    let bribe_transfer_ix = system_instruction::transfer(
-        &payer.pubkey(),
-        &bloxroute_wallet,
-        bribe_amount,
-    );
-
-    Ok(bribe_transfer_ix) // Return the bribe transfer instruction
+    Ok(VersionedMessage::V0(message))
 }

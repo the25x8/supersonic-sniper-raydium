@@ -1,3 +1,5 @@
+mod raydium;
+
 use std::str::FromStr;
 use std::sync::Arc;
 use chrono::DateTime;
@@ -17,8 +19,8 @@ use tokio_util::sync::CancellationToken;
 use crate::config::AppConfig;
 use crate::market::serum;
 use crate::error::handle_attempt;
-use crate::{market, raydium};
-use crate::raydium::{detector, MainnetProgramId};
+use crate::{market};
+use crate::raydium::{MainnetProgramId, get_amm_pool_reserves};
 use crate::solana::amount_utils::token_amount_to_float;
 use crate::solana::quote_mint::USDC_MINT;
 
@@ -56,11 +58,11 @@ pub struct PoolKeys {
     pub trade_fee_rate: u64,
 }
 
-/// Pool is a struct to represent the detected pool data,
+/// Pool is a struct to represent the detected raydium AMM pool data,
 /// it also includes serum market data and other meta info
 /// that program needs during the trading process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Pool {
+pub struct AMMPool {
     pub slot: u64,
 
     // Pool data
@@ -104,7 +106,7 @@ pub enum PoolType {
 /// with meta info such as subscriber type and start time.
 #[derive(Debug, Clone)]
 pub struct DetectedPool {
-    pub data: Pool,
+    pub data: AMMPool,
     pub source: SourceType, // Source is a channel where the pool was detected
     pub start_timestamp: DateTime<chrono::Utc>, // Subscription start time
 }
@@ -131,7 +133,7 @@ const MAX_FETCH_RETRIES: u32 = 3;
 pub async fn run(
     config: Arc<AppConfig>,
     client: Arc<RpcClient>,
-    tx: Sender<Pool>,
+    tx: Sender<AMMPool>,
     cancel_token: CancellationToken,
 ) {
     // Create watchlist to filter pools based on the base token
@@ -154,7 +156,7 @@ pub async fn run(
 
     // Initialize the Raydium detector
     let pool_tx = internal_tx.clone();
-    let raydium_detector = detector::RaydiumDetector::new(
+    let raydium_detector = raydium::RaydiumDetector::new(
         client.clone(),
         pool_tx.clone(),
         initialized_pool_cache.clone(),
@@ -228,7 +230,7 @@ pub async fn run(
                             token_metadata_result,
                             token_mint_result
                         ) = tokio::join!(
-                            raydium::get_amm_pool_reserves(
+                            get_amm_pool_reserves(
                                 rpc_client.clone(),
                                 &pool.keys.base_vault,
                                 &pool.keys.quote_vault,
@@ -277,8 +279,8 @@ pub async fn run(
 
                         // Calculate price using the correct reserve amounts
                         // Assign the reserves to the pool
-                        pool.base_reserves = pool.base_reserves / 10_usize.pow(pool.base_decimals as u32) as f64;
-                        pool.quote_reserves = pool.quote_reserves / 10_usize.pow(pool.quote_decimals as u32) as f64;
+                        pool.base_reserves /= 10_usize.pow(pool.base_decimals as u32) as f64;
+                        pool.quote_reserves /= 10_usize.pow(pool.quote_decimals as u32) as f64;
 
                         // Calculate the price of base token in terms of quote token
                         pool.initial_price = market::price::adjust_tokens_and_calculate_price(
@@ -428,7 +430,7 @@ async fn get_token_metadata(client: Arc<RpcClient>, mint_address: &Pubkey) -> Re
 }
 
 fn update_pool_by_results(
-    pool: &mut Pool,
+    pool: &mut AMMPool,
     pool_reserves_result: Option<Result<Vec<UiTokenAmount>, Box<dyn std::error::Error + Send + Sync>>>,
     market_state_result: Option<Result<serum::MarketStateV3, Box<dyn std::error::Error + Send + Sync>>>,
     token_mint_result: Option<Result<Mint, Box<dyn std::error::Error + Send + Sync>>>,

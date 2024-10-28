@@ -122,8 +122,7 @@ impl Trade {
         self.quote_in_amount = buy_amount;
 
         // Add the order bribe to the total bribe for the trade
-        let bribe = spl_token::amount_to_ui_amount(order.executor_bribe, order.in_decimals);
-        self.total_bribe += bribe;
+        self.total_bribe += lamports_to_sol(order.executor_bribe);
         self.buy_order = Some(order); // Register the buy order for the trade
 
         self.updated_at = current_timestamp();
