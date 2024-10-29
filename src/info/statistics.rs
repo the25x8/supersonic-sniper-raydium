@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use dashmap::DashMap;
 use log::info;
+use solana_program::native_token::lamports_to_sol;
 use solana_program::pubkey::Pubkey;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -28,44 +29,51 @@ pub async fn print_total_stats() {
 
     // Collect completed trades and calculate totals per wallet
     for trade in trades_history.iter() {
-        let completed_sell_order = trade.get_completed_sell_order();
-        if completed_sell_order.is_none() {
-            continue;
-        }
-
-        let completed_sell_order = completed_sell_order.unwrap();
-
         // Get the wallet pubkey
         let wallet = trade.wallet;
 
         // Get or insert the stats struct for this wallet
         let stats = wallet_stats.entry(wallet).or_insert_with(WalletStats::new);
 
-        // Update stats
+        // Update the stats
         stats.total_spent += trade.quote_in_amount;
-        stats.total_profit += trade.profit_amount;
-        stats.completed_trades.push(trade.clone());
 
-        // Update counts
-        match completed_sell_order.kind {
-            OrderKind::HoldTime => {
-                if trade.profit_percent > 0.0 {
-                    stats.profitable_trades += 1;
+        let fees = lamports_to_sol(trade.total_compute_units);
+        let net_profit = trade.profit_amount - fees - trade.total_bribe;
+        stats.total_profit += net_profit;
+
+        // Add fees and tips
+        stats.fees += fees;
+        stats.tips += trade.total_bribe;
+
+        // Increment the success or failure counter if the trade is completed
+        if trade.is_completed() {
+            let completed_sell_order = trade.get_completed_sell_order();
+            if completed_sell_order.is_none() {
+                continue;
+            }
+
+            let completed_sell_order = completed_sell_order.unwrap();
+            match completed_sell_order.kind {
+                OrderKind::HoldTime => if trade.profit_percent > 0.0 {
+                    stats.successes += 1;
                 } else {
-                    stats.unprofitable_trades += 1;
-                }
+                    stats.failures += 1;
+                },
+                OrderKind::TakeProfit => stats.successes += 1,
+                OrderKind::StopLoss => stats.failures += 1,
+                _ => {}
             }
-            OrderKind::TakeProfit => {
-                stats.profitable_trades += 1;
-            }
-            OrderKind::StopLoss => {
-                stats.unprofitable_trades += 1;
-            }
-            _ => {}
+        } else {
+            // Otherwise, increment the error counter
+            stats.errors += 1;
         }
+
+        // Add the trade to the completed trades list
+        stats.completed_trades.push(trade.clone());
     }
 
-    // Now, for each wallet, compute the stats and print them
+    // Calculate and print the stats per wallet
     for (wallet, stats) in wallet_stats.iter() {
         let total_trades = stats.completed_trades.len();
         let total_profit_percent = if stats.total_spent > 0.0 {
@@ -99,12 +107,16 @@ pub async fn print_total_stats() {
         info!(
             "\n📊 Trade History Statistics for Wallet: {}\n\
             =================================================\n\
-            📝 Trades: {}\n\
+            📝 Total trades: {}\n\
             💰 Turnover: {:.10} SOL\n\
             💵 Total Profit: {:.10} SOL {}\n\
-            📈 Total Profit Percent: {:.2}% {}\n\
-            ✅ Successful Trades: {}\n\
-            ❌ Unsuccessful Trades: {}\n\
+            📈 Profit Percent: {:.2}% {}\n\
+            🏦 Fees: {:.10} SOL\n\
+            💸 Tips: {:.10} SOL\n\
+            \n\
+            ✅ Successful: {}\n\
+            ❌ Unsuccessful: {}\n\
+            🚫 Errors: {}\n\
             🔟 Last 10 Trades Profitability: {:.2}% {}\n",
             wallet,
             total_trades,
@@ -113,8 +125,11 @@ pub async fn print_total_stats() {
             if stats.total_profit >= 0.0 { "📈" } else { "📉" },
             total_profit_percent,
             if total_profit_percent >= 0.0 { "📈" } else { "📉" },
-            stats.profitable_trades,
-            stats.unprofitable_trades,
+            stats.fees,
+            stats.tips,
+            stats.successes,
+            stats.failures,
+            stats.errors,
             last_10_profit_percent,
             if last_10_profit_percent >= 50.0 { "👍" } else { "👎" },
         );
@@ -125,8 +140,11 @@ pub async fn print_total_stats() {
 struct WalletStats {
     total_spent: f64,
     total_profit: f64,
-    profitable_trades: usize,
-    unprofitable_trades: usize,
+    fees: f64,
+    tips: f64,
+    successes: u32,
+    failures: u32,
+    errors: u32,
     completed_trades: Vec<Trade>,
 }
 
@@ -135,8 +153,11 @@ impl WalletStats {
         WalletStats {
             total_spent: 0.0,
             total_profit: 0.0,
-            profitable_trades: 0,
-            unprofitable_trades: 0,
+            fees: 0.0,
+            tips: 0.0,
+            successes: 0,
+            failures: 0,
+            errors: 0,
             completed_trades: Vec::new(),
         }
     }

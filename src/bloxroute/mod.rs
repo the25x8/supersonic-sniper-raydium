@@ -52,8 +52,8 @@ struct Fee {
     percent: f64,
 }
 
-pub async fn create_amm_swap_tx(
-    http_client: Client,
+pub async fn create_swap_amm(
+    client: Client,
     api_host: &str,
     auth_header: &str,
     owner_address: &str,
@@ -81,7 +81,7 @@ pub async fn create_amm_swap_tx(
     let url = format!("{}/api/v2/raydium/swap", api_host);
 
     // Send the POST request
-    let response = http_client
+    let response = client
         .post(url)
         .header("Authorization", auth_header)
         .header("Content-Type", "application/json")
@@ -96,8 +96,7 @@ pub async fn create_amm_swap_tx(
         return Err(format!(
             "HTTP request failed with status {}: {}",
             status, error_text
-        )
-            .into());
+        ).into());
     }
 
     // Parse the response JSON

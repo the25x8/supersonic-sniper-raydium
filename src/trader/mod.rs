@@ -495,10 +495,7 @@ impl Trader {
 
                         // Convert the min amount to the raw amount
                         let min_amount_out = spl_token::ui_amount_to_amount(min_amount_out, sell_out_decimals);
-                        let bloxroute_bribe = spl_token::ui_amount_to_amount(
-                            trade.strategy.sell_bribe.unwrap_or(0.0),
-                            sell_out_decimals,
-                        );
+                        let executor_bribe = sol_to_lamports(trade.strategy.sell_bribe.unwrap_or(0.0));
 
                         // Determine the possible sell orders based on the strategy.
                         let possible_sell_orders = vec![
@@ -534,7 +531,7 @@ impl Trader {
                                     sell_in_decimals,
                                     sell_out_decimals,
                                     trade.strategy.take_profit_executor,
-                                    bloxroute_bribe,
+                                    executor_bribe,
                                     trade.strategy.sell_delay,
                                 ),
                             ),
@@ -552,7 +549,7 @@ impl Trader {
                                     sell_in_decimals,
                                     sell_out_decimals,
                                     stop_loss_executor,
-                                    bloxroute_bribe,
+                                    executor_bribe,
                                     trade.strategy.sell_delay,
                                 ),
                             )
@@ -799,21 +796,6 @@ impl Trader {
             return Err(());
         }
 
-        // Define should we use BloxRoute for the buy order
-        let use_bloxroute = {
-            // Disable if it is not enabled in the config
-            if !bloxroute_enabled {
-                false;
-            }
-
-            // Set to true if the buy executor is BloxRoute
-            if trade.strategy.buy_executor == ExecutorType::Bloxroute {
-                true;
-            }
-
-            false
-        };
-
         // Prepare the buy order
         let amount_in = trade.strategy.quote_amount;
 
@@ -838,6 +820,7 @@ impl Trader {
 
         let raw_amount_in = spl_token::ui_amount_to_amount(amount_in, in_decimals);
         let raw_min_amount_out = spl_token::ui_amount_to_amount(min_amount_out, out_decimals);
+        let executor_type = trade.strategy.buy_executor.clone();
         let executor_bribe = sol_to_lamports(trade.strategy.buy_bribe.unwrap_or(0.0));
 
         let buy_order = Order::new(
@@ -851,12 +834,7 @@ impl Trader {
             &out_mint,
             in_decimals,
             out_decimals,
-            // Determine the executor type for the buy order
-            if use_bloxroute {
-                ExecutorType::Bloxroute
-            } else {
-                ExecutorType::RPC
-            },
+            executor_type,
             executor_bribe,
             trade.strategy.buy_delay,
         );

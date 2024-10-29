@@ -8,6 +8,8 @@ mod solana;
 mod executor;
 mod market;
 mod detector;
+mod bloxroute;
+mod jito;
 
 use std::sync::Arc;
 use std::time::Duration;
