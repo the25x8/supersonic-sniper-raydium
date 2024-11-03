@@ -1,5 +1,5 @@
 use solana_account_decoder::parse_token::UiTokenAmount;
-use solana_program::pubkey::Pubkey;
+use solana_sdk::pubkey::Pubkey;
 use crate::solana::quote_mint::USDC_MINT;
 
 /// Converts the reserves to f64 and calculates the price.

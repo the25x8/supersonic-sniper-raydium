@@ -1,6 +1,6 @@
 use borsh_derive::BorshSerialize;
 use solana_program::instruction::{AccountMeta, Instruction};
-use solana_program::pubkey::Pubkey;
+use solana_sdk::pubkey::Pubkey;
 use crate::detector::PoolKeys;
 use crate::raydium::MainnetProgramId;
 

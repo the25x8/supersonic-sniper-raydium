@@ -65,6 +65,10 @@ pub struct DetectorConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TraderConfig {
     pub strategies: HashMap<String, StrategyConfig>, // Map of strategies and their conditions.
+
+    // Maximum number of open trades. Trader will not open new trades
+    // for the new pairs if the limit is reached.
+    pub max_open_trades: u8,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -164,6 +168,12 @@ pub struct StrategyConfig {
     // Zero means any price impact is allowed.
     pub max_price_impact: f64,
 
+    // The volatility filter designed to detect scams by monitoring the price
+    // volatility of a token after a buy order. If the price volatility remains
+    // below a specified threshold within a certain time frame, the bot will sell
+    // the tokens immediately to avoid potential losses.
+    pub volatility_filter: VolatilityFilter,
+
     pub max_retries: u8, // Number of retries if the buy order fails.
     pub quote_amount: f64, // Amount of quote currency to spend on the buy order.
 
@@ -183,6 +193,14 @@ pub struct StrategyConfig {
     // It is recommended to use a 70/30 split between priority fee and jito tip
     pub buy_bribe: Option<f64>, // Amount in SOL
     pub sell_bribe: Option<f64>, // Amount in SOL
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct VolatilityFilter {
+    pub enabled: bool,
+    pub window: i64, // Window in milliseconds during which the filter can be applied.
+    pub timeout: i64, // Timeout in milliseconds before checking the volatility.
+    pub change_percent: f64, // The percentage change in price.
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

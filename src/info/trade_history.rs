@@ -51,6 +51,7 @@ fn format_trade_row(trade: &Trade) -> String {
                 OrderKind::StopLoss => "Stop loss",
                 OrderKind::TakeProfit => "Take profit",
                 OrderKind::HoldTime => "Hold time",
+                OrderKind::Emergency => "Emergency",
                 _ => "Unknown",
             }
         } else if trade.error.is_some() {

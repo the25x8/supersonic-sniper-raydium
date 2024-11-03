@@ -12,7 +12,7 @@ use solana_client::rpc_client::SerializableTransaction;
 use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_client::tpu_client::TpuClientConfig;
 use solana_program::instruction::InstructionError;
-use solana_program::pubkey::Pubkey;
+use solana_sdk::pubkey::Pubkey;
 use solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool};
 use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::signature::Signature;
@@ -33,7 +33,8 @@ use crate::solana;
 use crate::solana::extract_token_balance_change;
 use crate::wallet::Wallet;
 
-const MAX_SELL_RETRIES: u32 = 10; // Maximum retry attempts for sending txs to the blockchain
+const MAX_SEND_TX_RETRIES: u32 = 10; // Maximum retry attempts for sending txs to the blockchain
+const TX_BACKOFF_DELAY: u64 = 100; // Backoff delay in milliseconds for sell orders
 const BLOXROUTE_TIP_ACCOUNT: &str = "HWEoBxYs7ssKuudEjzjmpfJVX7Dvi7wescFsVx2L5yoY";
 
 #[derive(Copy, Clone)]
@@ -329,7 +330,7 @@ async fn execute_order(
     let start_time = Utc::now().time();
 
     // We try only once when buy, and retry N times when sell
-    let max_attempts = if order.direction == OrderDirection::QuoteIn { 1 } else { MAX_SELL_RETRIES };
+    let max_attempts = if order.direction == OrderDirection::QuoteIn { 1 } else { MAX_SEND_TX_RETRIES };
     let mut send_tx_attempts = 0;
 
     // Get tip account based on the executor type
@@ -451,7 +452,7 @@ async fn execute_order(
                     Ok(signature) => signature,
                     Err(e) => {
                         error!("Failed to send transaction via Jito: {}", e);
-                        match handle_attempt(&mut send_tx_attempts, max_attempts, 100).await {
+                        match handle_attempt(&mut send_tx_attempts, max_attempts, TX_BACKOFF_DELAY).await {
                             Ok(_) => continue,
                             Err(_) => return Err(e),
                         }
@@ -467,7 +468,7 @@ async fn execute_order(
                     Ok(signature) => signature,
                     Err(e) => {
                         error!("Failed to send transaction via rpc: {}", e);
-                        match handle_attempt(&mut send_tx_attempts, max_attempts, 100).await {
+                        match handle_attempt(&mut send_tx_attempts, max_attempts, TX_BACKOFF_DELAY).await {
                             Ok(_) => continue,
                             Err(_) => return Err(e),
                         }
@@ -480,7 +481,7 @@ async fn execute_order(
                 Ok(signature) => signature,
                 Err(e) => {
                     error!("Failed to send transaction via TPU: {}", e);
-                    match handle_attempt(&mut send_tx_attempts, max_attempts, 100).await {
+                    match handle_attempt(&mut send_tx_attempts, max_attempts, TX_BACKOFF_DELAY).await {
                         Ok(_) => continue,
                         Err(_) => return Err(e),
                     }
@@ -502,30 +503,42 @@ async fn execute_order(
                 // Try to extract the transaction error from the RPC error
                 let tx_err = e.get_transaction_error();
                 if let Some(err) = tx_err {
-                    return match err {
+                    match err {
                         // Handle instruction error
                         TransactionError::InstructionError(_, instruction_err) => {
-                            return match instruction_err {
+                            match instruction_err {
                                 InstructionError::Custom(code) => {
                                     // 38 -> InvalidSplTokenAccount
+                                    // 30 -> exceeds desired slippage limit
                                     // 22 -> InvalidStatus
                                     // retry only on invalid status
-                                    if code == 22 {
-                                        error!("Invalid AMM status, retrying...");
-                                        match handle_attempt(&mut send_tx_attempts, max_attempts, 100).await {
-                                            Ok(_) => continue,
-                                            Err(_) => Err(Box::new(instruction_err)),
+                                    match code {
+                                        22 => {
+                                            error!("Invalid AMM status, retrying...");
+                                            match handle_attempt(&mut send_tx_attempts, max_attempts, 100).await {
+                                                Ok(_) => continue,
+                                                Err(_) => return Err(Box::new(instruction_err)),
+                                            }
                                         }
-                                    } else {
-                                        // Otherwise, return the custom instruction error and abort
-                                        error!("Custom instruction error: {}", instruction_err);
-                                        Err(Box::new(instruction_err))
+                                        30 => {
+                                            error!("Exceeds desired slippage limit: {}", instruction_err);
+                                            return Err(Box::new(instruction_err));
+                                        }
+                                        38 => {
+                                            error!("Invalid SPL token account: {}", instruction_err);
+                                            return Err(Box::new(instruction_err));
+                                        }
+                                        _ => {
+                                            // Otherwise, return the custom program error and abort
+                                            error!("Custom program error: {}", instruction_err);
+                                            return Err(Box::new(instruction_err));
+                                        }
                                     }
                                 }
 
                                 _ => {
-                                    error!("Instruction error: {}", instruction_err);
-                                    Err(Box::new(instruction_err))
+                                    error!("Program error: {}", instruction_err);
+                                    return Err(Box::new(instruction_err));
                                 }
                             }
                         }
@@ -533,21 +546,21 @@ async fn execute_order(
                         // Handle insufficient funds error
                         TransactionError::InsufficientFundsForFee => {
                             error!("Insufficient funds for fee: {}", err);
-                            Err(Box::new(err))
+                            return Err(Box::new(err));
                         }
 
                         // Abort on other transaction errors
                         _ => {
                             error!("Transaction error: {}", err);
-                            Err(Box::new(err))
+                            return Err(Box::new(err));
                         }
                     };
                 }
 
 
-                // Otherwise, it's RPC error, retry
+                // Otherwise, handle the RPC error and retry if needed
                 error!("Failed to confirm transaction: {}", e);
-                match handle_attempt(&mut send_tx_attempts, max_attempts, 100).await {
+                match handle_attempt(&mut send_tx_attempts, max_attempts, TX_BACKOFF_DELAY).await {
                     Ok(_) => continue,
                     Err(_) => return Err(Box::new(e)),
                 }

@@ -6,7 +6,7 @@ use log::error;
 use solana_account_decoder::parse_token::UiTokenAmount;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_program::program_pack::Pack;
-use solana_program::pubkey::Pubkey;
+use solana_sdk::pubkey::Pubkey;
 use spl_token::state::Mint;
 use crate::error::handle_attempt;
 

@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use base64::Engine;
 use borsh::BorshDeserialize;
-use chrono::Utc;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use futures::stream::SplitSink;
@@ -27,9 +26,9 @@ use tungstenite::Message;
 use crate::error::handle_attempt;
 use crate::{market, raydium};
 use crate::config::BloxrouteConfig;
-use crate::detector::{AMMPool, PoolKeys};
+use crate::detector::{PoolKeys};
 
-const PRICE_CACHE_TTL: u64 = 1500; // Price cache time-to-live in milliseconds
+const PRICE_CACHE_TTL: u64 = 1000; // Price cache time-to-live in milliseconds
 
 // Maximum retry attempts for fetching data from the blockchain
 const MAX_SUBSCRIPTION_RETRIES: u32 = 5;

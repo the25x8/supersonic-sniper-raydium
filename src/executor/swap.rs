@@ -1,16 +1,12 @@
-use std::str::FromStr;
 use log::error;
-use solana_program::instruction::Instruction;
 use solana_program::pubkey::Pubkey;
 use solana_program::system_instruction;
 use spl_associated_token_account::{get_associated_token_address, instruction as ata_instruction};
 use solana_program::hash::Hash;
 use solana_program::message::{v0, VersionedMessage};
-use solana_program::native_token::sol_to_lamports;
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::signature::{Keypair, Signer};
 use crate::config::ExecutorType;
-use crate::executor::executor::TipAccounts;
 use crate::executor::order::Order;
 use crate::raydium::{build_swap_in_instruction};
 use crate::solana;

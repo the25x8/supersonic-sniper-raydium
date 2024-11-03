@@ -9,7 +9,7 @@ pub use liquidity::{
 };
 
 use std::str::FromStr;
-use solana_program::pubkey::Pubkey;
+use solana_sdk::pubkey::Pubkey;
 
 
 /// Enum to represent the mainnet program IDs.

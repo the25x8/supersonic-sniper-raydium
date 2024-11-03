@@ -5,8 +5,7 @@ use serde_json::{Value};
 use solana_sdk::transaction::VersionedTransaction;
 use std::error::Error;
 use std::str::FromStr;
-use log::error;
-use solana_program::pubkey::Pubkey;
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 
 pub struct JitoClient {

@@ -1,7 +1,7 @@
 use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use solana_program::pubkey::Pubkey;
+use solana_sdk::pubkey::Pubkey;
 use crate::config::ExecutorType;
 use crate::detector::PoolKeys;
 use crate::trader::current_timestamp;
@@ -138,6 +138,9 @@ pub enum OrderKind {
     HoldTime = 2,
     TakeProfit = 3,
     StopLoss = 4,
+
+    /// Special order that can be created on the fly to liquidate position.
+    Emergency = 5,
 }
 
 impl fmt::Display for OrderKind {
@@ -147,6 +150,7 @@ impl fmt::Display for OrderKind {
             OrderKind::HoldTime => write!(f, "HoldTime"),
             OrderKind::TakeProfit => write!(f, "TakeProfit"),
             OrderKind::StopLoss => write!(f, "StopLoss"),
+            OrderKind::Emergency => write!(f, "Emergency"),
         }
     }
 }

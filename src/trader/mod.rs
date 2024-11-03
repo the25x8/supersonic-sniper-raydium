@@ -1,5 +1,8 @@
 pub mod backup;
 pub mod trade;
+mod strategy;
+mod seller;
+mod preventer;
 
 use std::collections::HashMap;
 use solana_sdk::pubkey::Pubkey;
@@ -27,17 +30,6 @@ use crate::wallet::Wallet;
 /// It handles events from the Detector module efficiently and performs post-swap actions
 /// such as transferring purchased tokens to specified wallets and implementing advanced
 /// selling strategies.
-
-pub struct ChooseStrategyParams {
-    pub pool: AMMPool,
-    pub freezable: bool,
-    pub mint_renounced: bool,
-    pub meta_mutable: bool,
-    pub base_supply: u64,
-    pub base_reserves: f64,
-    pub quote_reserves: f64,
-    pub price: f64,
-}
 
 pub struct Trader {
     client: Arc<RpcClient>,
@@ -265,139 +257,13 @@ impl Trader {
         let active_trades = active_trades.clone();
         tokio::spawn(async move {
             while let Ok(market_data) = market_data_rx.recv().await {
-                // Process the trades for the current market
-                if let Some(trades_list) = active_trades.get(&market_data.pool) {
-                    for trade in trades_list.iter() {
-                        // Skip trade if completed
-                        if trade.is_completed() {
-                            continue;
-                        }
-
-                        // Buy order shouldn't be None and should be completed
-                        let buy_order = trade.buy_order.clone();
-                        if buy_order.is_none() || buy_order.as_ref().unwrap().status != OrderStatus::Completed {
-                            warn!("Buy order not found or not completed for Trade {}", trade.id);
-                            continue;
-                        }
-
-                        // Check the take profit order condition
-                        let take_profit_order = trade.take_profit_order.clone();
-                        if let Some(take_profit_order) = take_profit_order {
-                            // Calculate the price change and take profit
-                            let take_profit_price = trade.buy_price + (trade.buy_price * (trade.strategy.take_profit / 100.0));
-                            let take_profit_percent = (market_data.price - trade.buy_price) / trade.buy_price * 100.0;
-
-                            debug!(
-                                "\n🟢 Checking Take Profit Condition for Trade {}\n\
-                                 ──────────────────────────────────────────────\n\
-                                 - Price Change:      {:+.10}%\n\
-                                 - Buy Price:         {:.10}\n\
-                                 - Current Price:     {:.10}\n\
-                                 - Take Profit Price: {:.10} (at +{:.2}%)\n\
-                                 - Strategy:          Take Profit at +{:.2}%\n",
-                                trade.id,
-                                take_profit_percent,        // Change in price as a percentage
-                                trade.buy_price,            // Original buy price
-                                market_data.price,          // Current market price
-                                take_profit_price,          // Calculated take profit price
-                                trade.strategy.take_profit,
-                                trade.strategy.take_profit  // Strategy setting for take profit
-                            );
-
-                            // If the price has increased to or beyond the take profit threshold, execute the order
-                            if take_profit_percent >= trade.strategy.take_profit {
-                                match executor.order(take_profit_order).await {
-                                    Ok(_) => {
-                                        info!(
-                                            "\n🟢 ✅ Take Profit Condition Met for Trade {}\n\
-                                             ──────────────────────────────────────────────\n\
-                                             - Price Change:      {:+.10}%\n\
-                                             - Buy Price:         {:.10}\n\
-                                             - Current Price:     {:.10}\n\
-                                             - Take Profit Price: {:.10} (at +{:.2}%)\n\
-                                             - Strategy:          Take Profit at +{:.2}%\n\
-                                             \
-                                             🚀 Take Profit Order Executed!\n",
-                                            trade.id,
-                                            take_profit_percent,        // Change in price as a percentage
-                                            trade.buy_price,            // Original buy price
-                                            market_data.price,          // Current market price
-                                            take_profit_price,          // Calculated take profit price
-                                            trade.strategy.take_profit,
-                                            trade.strategy.take_profit  // Strategy setting for take profit
-                                        );
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "❌ Failed to execute take profit order for Trade {}: {}",
-                                            trade.id, e
-                                        );
-                                    }
-                                }
-
-                                // Skip the trade if the take profit order was executed
-                                continue;
-                            }
-                        }
-
-                        // Check the stop loss condition
-                        let stop_loss_order = trade.stop_loss_order.clone();
-                        if let Some(stop_loss_order) = stop_loss_order {
-                            // Calculate the price change and stop loss
-                            let stop_loss_price = trade.buy_price - (trade.buy_price * (trade.strategy.stop_loss / 100.0));
-                            let stop_loss_percent = (trade.buy_price - market_data.price) / trade.buy_price * 100.0;
-
-                            debug!(
-                                "\n🔴 Checking Stop Loss Condition for Trade {}\n\
-                                 ──────────────────────────────────────────────\n\
-                                 - Price Change:      {:+.10}%\n\
-                                 - Buy Price:         {:.10}\n\
-                                 - Current Price:     {:.10}\n\
-                                 - Stop Loss Price:   {:.10} (at -{:.2}%)\n\
-                                 - Strategy:          Stop Loss at -{:.2}%\n",
-                                trade.id,
-                                stop_loss_percent,          // Change in price as a percentage
-                                trade.buy_price,            // Original buy price
-                                market_data.price,          // Current market price
-                                stop_loss_price,            // Calculated stop loss price
-                                trade.strategy.stop_loss,
-                                trade.strategy.stop_loss    // Strategy setting for stop loss
-                            );
-
-                            // If the price has dropped to or beyond the stop loss threshold, execute the order
-                            if stop_loss_percent >= trade.strategy.stop_loss {
-                                match executor.order(stop_loss_order).await {
-                                    Ok(_) => {
-                                        info!(
-                                            "\n❌ Stop Loss Condition Met for Trade {}\n\
-                                             ──────────────────────────────────────────────\n\
-                                             - Price Change:      {:+.10}%\n\
-                                             - Buy Price:         {:.10}\n\
-                                             - Current Price:     {:.10}\n\
-                                             - Stop Loss Price:   {:.10} (at -{:.2}%)\n\
-                                             - Strategy:          Stop Loss at -{:.2}%\n\
-                                             \
-                                             Stop Loss Order Executed!",
-                                            trade.id,
-                                            stop_loss_percent,          // Change in price as a percentage
-                                            trade.buy_price,            // Original buy price
-                                            market_data.price,          // Current market price
-                                            stop_loss_price,            // Calculated stop loss price
-                                            trade.strategy.stop_loss,
-                                            trade.strategy.stop_loss    // Strategy setting for stop loss
-                                        );
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "❌ Failed to execute stop loss order for Trade {}: {}",
-                                            trade.id, e
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                // Process the updated market data and try to 
+                // sell tokens if some conditions are met.
+                seller::try_to_sell(
+                    &market_data,
+                    executor.clone(),
+                    active_trades.clone(),
+                ).await;
             }
         });
     }
@@ -450,237 +316,24 @@ impl Trader {
 
         // Handle the order based on the direction
         match order.direction {
-            // In case of buy order create sell orders and schedule them.
-            OrderDirection::QuoteIn => {
-                // The min amount out is the amount of tokens that should be received after selling.
-                // Zero if the sell slippage is not set.
-                let min_amount_out = {
-                    if trade.strategy.sell_slippage > 0.0 {
-                        let balance_change = spl_token::amount_to_ui_amount(
-                            order.balance_change,
-                            order.in_decimals,
-                        );
-                        balance_change - (balance_change * (trade.strategy.sell_slippage / 100.0))
-                    } else {
-                        0.0
-                    }
-                };
+            // Handle buy order completion
+            OrderDirection::QuoteIn => trade::update_trade_after_buy(
+                trade,
+                &order,
+                executor,
+                trades,
+                market_monitor,
+            ).await,
 
-                // Re-acquire the lock to update the trade with buy details
-                if let Some(mut trades_ref) = trades.get_mut(&pool_pubkey) {
-                    if let Some(trade_in_map) = trades_ref.value_mut().iter_mut().find(|t| t.id == trade.id) {
-                        trade_in_map.buy(&order); // Pass the confirmed order to the trade
-                    }
-                    // trades_ref mutable reference is dropped here
-                }
-
-                // Register the new orders for the trade (before executing)
-                if let Some(mut trades_ref) = trades.get_mut(&pool_pubkey) {
-                    if let Some(trade_in_map) = trades_ref.value_mut().iter_mut().find(|t| t.id == trade.id) {
-                        // Define stop-loss executor for the order
-                        let stop_loss_executor = {
-                            if trade.strategy.stop_loss_executor.is_some() {
-                                trade.strategy.stop_loss_executor.unwrap()
-                            } else {
-                                ExecutorType::RPC
-                            }
-                        };
-
-                        // Define mint and decimals of the sell order,
-                        // based on the buy order's in and out mints.
-                        let sell_in_mint = order.out_mint; // Buy order's out mint is the in mint for the sell order
-                        let sell_out_mint = order.in_mint; // Buy order's in mint is the out mint for the sell order
-                        let sell_in_decimals = order.out_decimals;
-                        let sell_out_decimals = order.in_decimals;
-
-                        // Convert the min amount to the raw amount
-                        let min_amount_out = spl_token::ui_amount_to_amount(min_amount_out, sell_out_decimals);
-                        let executor_bribe = sol_to_lamports(trade.strategy.sell_bribe.unwrap_or(0.0));
-
-                        // Determine the possible sell orders based on the strategy.
-                        let possible_sell_orders = vec![
-                            (
-                                trade.strategy.hold_time > 0,
-                                Order::new(
-                                    OrderDirection::QuoteOut,
-                                    trade.id,
-                                    OrderKind::HoldTime,
-                                    &trade.pool_keys,
-                                    order.balance_change, // amount of received tokens
-                                    min_amount_out,
-                                    &sell_in_mint,
-                                    &sell_out_mint,
-                                    sell_in_decimals,
-                                    sell_out_decimals,
-                                    ExecutorType::RPC, // Hold time order is always executed by RPC
-                                    0, // RPC doesn't require a bribe
-                                    trade.strategy.hold_time,
-                                ),
-                            ),
-                            (
-                                trade.strategy.take_profit > 0.0,
-                                Order::new(
-                                    OrderDirection::QuoteOut,
-                                    trade.id,
-                                    OrderKind::TakeProfit,
-                                    &trade.pool_keys,
-                                    order.balance_change, // amount of received tokens
-                                    min_amount_out,
-                                    &sell_in_mint,
-                                    &sell_out_mint,
-                                    sell_in_decimals,
-                                    sell_out_decimals,
-                                    trade.strategy.take_profit_executor,
-                                    executor_bribe,
-                                    trade.strategy.sell_delay,
-                                ),
-                            ),
-                            (
-                                trade.strategy.stop_loss > 0.0,
-                                Order::new(
-                                    OrderDirection::QuoteOut,
-                                    trade.id,
-                                    OrderKind::StopLoss,
-                                    &trade.pool_keys,
-                                    order.balance_change, // amount of received tokens
-                                    min_amount_out,
-                                    &sell_in_mint,
-                                    &sell_out_mint,
-                                    sell_in_decimals,
-                                    sell_out_decimals,
-                                    stop_loss_executor,
-                                    executor_bribe,
-                                    trade.strategy.sell_delay,
-                                ),
-                            )
-                        ];
-
-                        // Execute the orders where the condition is true
-                        for (condition, order) in possible_sell_orders {
-                            if condition {
-                                let kind = order.kind;
-                                match trade_in_map.initiate_sell(order) {
-                                    Ok(_) => (),
-                                    Err(e) => {
-                                        error!("Failed to schedule {} order: {}", kind, e);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Copy hold time order for execution
-                        let hold_order = trade_in_map.clone().hold_time_order;
-                        drop(trades_ref); // Explicitly drop the mutable reference here
-
-                        // If hold time is set, execute the hold order immediately
-                        if hold_order.is_some() {
-                            // Hold order is the first order in the list
-                            if let Err(e) = executor.order(hold_order.unwrap()).await {
-                                error!("Failed to schedule sell order: {}", e);
-                                return;
-                            }
-                        }
-                    }
-                }
-
-                // If you take profit or stop loss is set, add the pool to the watchlist
-                if trade.strategy.take_profit > 0.0 || trade.strategy.stop_loss > 0.0 {
-                    market_monitor.add_to_watchlist(&pool_pubkey, market::monitor::PoolMeta {
-                        keys: trade.pool_keys.clone(),
-                        base_decimals: trade.base_decimals,
-                        quote_decimals: trade.quote_decimals,
-                    });
-                }
-            }
-
-            // Process sell order
-            OrderDirection::QuoteOut => {
-                // Re-acquire the lock to update the trade
-                if let Some(mut trades_ref) = trades.get_mut(&pool_pubkey) {
-                    if let Some(trade_in_map) = trades_ref.value_mut().iter_mut().find(|t| t.id == trade.id) {
-                        // Pass the confirmed sell order to the trade
-                        if let Err(e) = trade_in_map.sell(&order) {
-                            error!("Failed to confirm sell order: {}", e);
-                            return;
-                        }
-
-                        // Return error if order isn't completed
-                        if !trade_in_map.is_completed() {
-                            error!("Sell order isn't completed for trade {}", order.trade_id);
-                        }
-
-                        // If the trade is completed, move it to the history and remove from active trades
-                        trade_in_map.archive();
-
-                        // Make a copy of the trade for history
-                        let trade_copy = trade_in_map.clone();
-                        let buy_order = trade_in_map.buy_order.as_ref().unwrap();
-                        let completed_sell_order = trade_in_map.get_completed_sell_order().unwrap();
-                        let completed_in = completed_sell_order.confirmed_at - buy_order.created_at;
-
-                        info!(
-                            "\n🟢 Trade Completed Successfully!\n\
-                             ───────────────────────────────\n\
-                             👉 Trade ID:        {}\n\
-                             👉 Result:          {}\n\
-                             📊 Pool:            {}\n\
-                             💰 Buy Price:       {:.10}\n\
-                             💰 Sell Price:      {:.10}\n\
-                             💰 Profit:          {:.10} (SOL)\n\
-                             💰 Profit %:        {:.2}%\n\
-                             🕒 Hold Time:       {} ms\n\
-                             🤔 Strategy:        {}\n\
-                             🕒 Buy Time:        {}\n\
-                             🕒 Sell Time:       {}\n\
-                             🚀 Completed in:    {} sec.\n",
-                            trade_in_map.id,
-                            completed_sell_order.kind,
-                            trade_in_map.pool_keys.id.to_string(),
-                            trade_in_map.buy_price,
-                            trade_in_map.sell_price,
-                            trade_in_map.profit_amount,
-                            trade_in_map.profit_percent,
-                            trade_in_map.strategy.hold_time,
-                            trade_in_map.strategy_name,
-                            chrono::Utc.timestamp_opt(buy_order.confirmed_at as i64, 0).unwrap().to_rfc3339(),
-                            chrono::Utc.timestamp_opt(completed_sell_order.confirmed_at as i64, 0).unwrap().to_rfc3339(),
-                            completed_in,
-                        );
-
-                        // Remove the trade from the trades_ref
-                        trades_ref.value_mut().retain(|t| t.id != trade_id);
-
-                        // Check if the trades_ref is empty
-                        let is_empty = trades_ref.value().is_empty();
-                        drop(trades_ref); // // Explicitly drop the mutable reference here
-
-                        // All async operations here after lock release
-
-                        // If it was the last trade for the pool, clean active trades
-                        // and remove pool from the watchlist.
-                        if is_empty {
-                            trades.remove(&pool_pubkey);
-                            market_monitor.remove_from_watchlist(&pool_pubkey);
-                        }
-
-                        // If it was not a hold time order, call the executor
-                        // to cancel the uncompleted hold time order
-                        if order.kind != OrderKind::HoldTime {
-                            if let Some(order) = trade_copy.hold_time_order.as_ref() {
-                                match executor.cancel_order(order.id).await {
-                                    Ok(_) => (),
-                                    Err(e) => {
-                                        error!("Failed to cancel hold time order: {}", e);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Save trade to history
-                        backup.save_trade_in_history(trade_copy).await;
-                    }
-                }
-            }
+            // Handle sell order completion
+            OrderDirection::QuoteOut => trade::update_trade_after_sell(
+                trade,
+                &order,
+                trades,
+                executor,
+                market_monitor,
+                backup,
+            ).await,
         }
     }
 
@@ -702,9 +355,9 @@ impl Trader {
         // Process the detected pool
         tokio::spawn(async move {
             // Choose the best strategy based on the pool data and the trader configuration
-            let (strategy_name, strategy) = match Self::choose_strategy(
+            let (strategy_name, strategy) = match strategy::choose_strategy(
                 &config.trader.strategies,
-                ChooseStrategyParams {
+                strategy::ChooseStrategyParams {
                     pool: pool.clone(),
                     base_reserves: pool.base_reserves,
                     quote_reserves: pool.quote_reserves,
@@ -739,7 +392,6 @@ impl Trader {
                 trade,
                 executor.clone(),
                 pool.initial_price,
-                config.bloxroute.enabled,
             ).await {
                 Ok(trade) => trade,
                 Err(_) => {
@@ -786,7 +438,6 @@ impl Trader {
         mut trade: Trade,
         executor: Arc<Executor>,
         current_price: f64,
-        bloxroute_enabled: bool,
     ) -> Result<Trade, ()> {
         // Confirm that at least one sell condition is set
         if trade.strategy.take_profit == 0.0 &&
@@ -864,153 +515,6 @@ impl Trader {
         };
 
         Ok(trade)
-    }
-
-    /// Chooses the best strategy based on the pool data and the trader configuration.
-    /// The function returns the configuration of the chosen strategy.
-    fn choose_strategy(strategies: &HashMap<String, StrategyConfig>, params: ChooseStrategyParams) -> Result<(String, StrategyConfig), ()> {
-        // Check that strategies are defined in the config
-        if strategies.is_empty() {
-            warn!("No strategies defined in the configuration");
-            return Err(());
-        }
-
-        // Iterate over the strategies in the config and check if the conditions are met
-        for (name, strategy) in strategies.iter() {
-            // Check should the token be freezable
-            if strategy.freezable != params.freezable {
-                warn!("Freezable condition not met");
-                continue;
-            }
-
-            // Can the mint authority mint new tokens
-            if strategy.mint_renounced != params.mint_renounced {
-                warn!("Mint renounced condition not met");
-                continue;
-            }
-
-            // Can the metadata be changed
-            if strategy.meta_mutable.is_some() && strategy.meta_mutable.unwrap() != params.meta_mutable {
-                warn!("Metadata mutable condition not met");
-                continue;
-            }
-
-            // Check quote symbol conditions
-            if let Some(quote_symbol) = strategy.quote_symbol.clone() {
-                // Check if the quote mint or base mint is wrapped SOL or USDC
-                if (quote_symbol == "WSOL" &&
-                    params.pool.keys.quote_mint != spl_token::native_mint::id() &&
-                    params.pool.keys.base_mint != spl_token::native_mint::id()) ||
-                    (quote_symbol == "USDC" &&
-                        params.pool.keys.quote_mint.to_string() != USDC_MINT &&
-                        params.pool.keys.base_mint.to_string() != USDC_MINT) {
-                    warn!("Quote symbol condition not met");
-                    continue;
-                }
-            }
-
-            // Check if the pool detected time is within the max delay
-            if params.pool.open_time.timestamp() > 0 {
-                let elapsed = chrono::Utc::now() - params.pool.timestamp;
-                if elapsed.num_milliseconds() > strategy.max_delay_since_detect as i64 {
-                    warn!("Max delay since open condition not met. {}, {}, {}",
-                        params.pool.open_time.timestamp_millis(),
-                        elapsed.num_milliseconds(),
-                        strategy.max_delay_since_detect,
-                    );
-                    continue;
-                }
-            }
-
-            // TODO Check additional data conditions, like website, social networks, audits, etc.
-
-            // Check price conditions
-            if Trader::is_condition_met(
-                strategy.price_condition.clone(),
-                params.price,
-                strategy.price,
-                strategy.price_range.clone(),
-            ) {
-                warn!("Price condition not met");
-                continue;
-            }
-
-            // Check reserves conditions
-            if Trader::is_condition_met(
-                strategy.reserves_quote_condition.clone(),
-                params.quote_reserves,
-                Some(strategy.reserves_quote.unwrap_or(0.0)),
-                strategy.reserves_quote_range.clone(),
-            ) {
-                warn!("Quote reserves condition not met");
-                continue;
-            }
-
-            if Trader::is_condition_met(
-                strategy.reserves_base_condition.clone(),
-                params.base_reserves,
-                Some(strategy.reserves_base.unwrap_or(0.0)),
-                strategy.reserves_base_range.clone(),
-            ) {
-                warn!("Base reserves condition not met");
-                continue;
-            }
-
-            // Check total supply conditions
-            if Trader::is_condition_met(
-                strategy.total_supply_condition.clone(),
-                params.base_supply as f64,
-                Some(strategy.total_supply.unwrap_or(0.0)),
-                strategy.total_supply_range.clone(),
-            ) {
-                warn!("Base supply condition not met");
-                continue;
-            }
-
-            // TODO Fetch market data, bids, asks, etc.
-
-            // All conditions are met, return the strategy
-            return Ok((name.to_string(), strategy.clone()));
-        }
-
-        // If no strategy is chosen, return an error
-        Err(())
-    }
-
-    /// Checks if a condition is met based on the target value and the value to compare.
-    pub fn is_condition_met(condition: Option<String>, value: f64, target: Option<f64>, target_range: Option<Vec<f64>>) -> bool {
-        if let Some(target_value) = target {
-            if condition.is_none() {
-                return false;
-            }
-
-            let is_met = match condition.unwrap().as_str() {
-                "gt" => value <= target_value,
-                "gte" => value < target_value,
-                "lt" => value >= target_value,
-                "lte" => value > target_value,
-                "eq" => value != target_value,
-
-                // In operator for ranges. Value must be in the range.
-                "in" => {
-                    if let Some(range) = target_range {
-                        return if range.len() == 2 {
-                            value < range[0] || value > range[1]
-                        } else {
-                            true
-                        };
-                    } else {
-                        true
-                    }
-                }
-                _ => false,
-            };
-
-            return is_met;
-        }
-
-        // If no target value is provided, skip the condition check and return true
-        true
     }
 }
 
