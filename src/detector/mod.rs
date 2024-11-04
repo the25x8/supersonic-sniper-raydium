@@ -209,10 +209,9 @@ pub async fn run(
 
                 let is_pubsub = detected_pool.source == SourceType::PubSub;
 
-                // If pool is not in watchlist and source is PubSub, we need to check if the pool key
-                // is in the initialized pool cache. That's the way how we can filter out the pools
-                // that were initialized after the detector started.
-                if is_pubsub && !pool.in_whitelist && !initialized_pool_cache.contains(&pool.keys.id) {
+                // If pubsub enabled pool should be in the initialized pool cache.
+                // Otherwise, it means that it's old pool and we should skip it.
+                if is_pubsub && !initialized_pool_cache.contains(&pool.keys.id) {
                     continue
                 }
 
