@@ -304,10 +304,10 @@ impl RaydiumDetector {
                 // )),
 
                 // Filter by market program ID
-                RpcFilterType::Memcmp(Memcmp::new(
-                    560,
-                    MemcmpEncodedBytes::Base58(MainnetProgramId::OpenbookMarket.get_pubkey().to_string()),
-                )),
+                // RpcFilterType::Memcmp(Memcmp::new(
+                //     560,
+                //     MemcmpEncodedBytes::Base58(MainnetProgramId::OpenbookMarket.get_pubkey().to_string()),
+                // )),
             ];
             let config = RpcProgramAccountsConfig {
                 filters: Some(filters),
