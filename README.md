@@ -2,7 +2,9 @@
 
 > :warning: This was an experiment for fun and purely for educational purposes. Ultimately, without robust analytics, it still operates at a loss like any other bot. While you're free to use these developments, I categorically do not recommend deploying them in a production environment. Furthermore, **trading meme coins is essentially a scam**. Although you might see short-term gains, in the long run you'll likely end up with nothing. Meme coins and Raydium on the Solana blockchain are often exploited by their owners and scammers to profit at the expense of inexperienced investors. Please, exercise caution.
 
-**Supersonic Sniper** is a high-performance trading bot designed to execute rapid buy and sell operations on the Raydium decentralized exchange (DEX) within the Solana blockchain network. Leveraging ultra-fast detection and execution capabilities, the bot aims to capitalize on new token listings and market movements with minimal latency.
+**Supersonic Sniper** is a ~~high performance~~ (not enough) trading bot designed to execute rapid buy and sell operations on the Raydium decentralized exchange (DEX) within the Solana blockchain network. Leveraging ultra-fast detection and execution capabilities, the bot aims to capitalize on new token listings and market movements with minimal latency.
+
+> ℹ️ This bot performs quickly enough, but if you want to guarantee entry into the first block with a success rate above 90%, you'll need to develop your own Geyser plugin, purchase a dedicated node, and configure it properly. You will also need a node for sending transactions. Synchronizing a Solana node on your own hardware can be a hassle - or you might have to pay a lot for a ready-made solution from a provider. Additionally, the bot must send multiple transactions to improve its chances: one directly to the Raydium program, and another as CPI via a proxy smart contract. Please note that this client does not work with the Geyser plugin. Based on my understanding of Rast, developing such a plugin could take months. I hope you find this information useful!
 
 ## Features
 
