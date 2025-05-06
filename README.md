@@ -1,6 +1,6 @@
 # Supersonic Sniper Bot
 
-> :warning: This was an experiment for fun and purely for educational purposes. Ultimately, without robust analytics, it still operates at a loss like any other bot. While you're free to use these developments, I categorically do not recommend deploying them in a production environment. Furthermore, **trading meme coins is essentially a scam**. Although you might see short-term gains, in the long run you'll likely end up with nothing. Meme coins and Raydium on the Solana blockchain are often exploited by their owners and scammers to profit at the expense of inexperienced investors. Please, exercise caution.
+> :warning: This was an experiment for fun and purely for educational purposes. Ultimately, without robust analytics, it still operates at a loss like any other bot. Furthermore, **meme coins are essentially a scam**.
 
 **Supersonic Sniper** is a ~~high performance~~ (not enough) trading bot designed to execute rapid buy and sell operations on the Raydium decentralized exchange (DEX) within the Solana blockchain network. Leveraging ultra-fast detection and execution capabilities, the bot aims to capitalize on new token listings and market movements with minimal latency.
 
