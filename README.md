@@ -5,7 +5,7 @@
 [Step-by-step guide to running the bot](https://github.com/yoozzeek/Supersonic-Memecoin-Sniper-Bot/blob/master/public/README.md)
 
 ## Disclaimer
-> :warning: This was an experiment for fun and purely for educational purposes. Ultimately, without robust analytics, it still operates at a loss like any other bot. Furthermore, **meme coins are essentially a scam**.
+> :warning: This was an experiment for fun and purely for educational purposes. Ultimately, without robust analytics, it still operates at a loss like any other bot.
 
 This bot performs quickly enough if you know what to buy. But if you want to guarantee entry into the first block with a success rate above 90%, you'll need much more: develop your own Geyser plugin, purchase a dedicated node, and configure it properly. You will also need a node for sending transactions. Synchronizing a Solana node on your own hardware can be a hassle - or you might have to pay a lot for a ready-made solution from a provider. 
 
